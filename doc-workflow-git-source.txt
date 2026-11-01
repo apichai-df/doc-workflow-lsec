@@ -1,0 +1,1776 @@
+﻿DOCUMENT WORKFLOW SOURCE FROM GIT
+
+============================================================
+FILE: .env.example
+============================================================
+
+NEXT_PUBLIC_SUPABASE_URL=https://YOUR_PROJECT.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=YOUR_PUBLISHABLE_OR_ANON_KEY
+SUPABASE_SERVICE_ROLE_KEY=YOUR_SERVICE_ROLE_KEY
+MICROSOFT_TENANT_ID=YOUR_TENANT_ID
+MICROSOFT_CLIENT_ID=YOUR_APP_CLIENT_ID
+MICROSOFT_CLIENT_SECRET=YOUR_CLIENT_SECRET
+SHAREPOINT_DRIVE_ID=YOUR_DOCUMENT_LIBRARY_DRIVE_ID
+SHAREPOINT_FOLDER_PATH=SignedDocuments
+
+
+============================================================
+FILE: .gitignore
+============================================================
+
+# Dependencies
+node_modules/
+
+# Next.js
+.next/
+out/
+
+# Build output
+dist/
+build/
+coverage/
+
+# Environment variables and secrets
+.env
+.env.local
+.env.development
+.env.production
+.env.test
+.env*.local
+
+# Vercel
+.vercel/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Operating system
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Temporary source bundles
+document-workflow-source*.txt
+
+# Certificates and private keys
+*.pem
+*.key
+*.pfx
+*.p12
+
+============================================================
+FILE: README.md
+============================================================
+
+# Enterprise Document Workflow
+เธเธฃเนเธญเธก Deploy เธเธ Vercel: Next.js + Supabase + PDF.js/browser PDF viewer + Canvas signature + pdf-lib + Microsoft Graph/SharePoint.
+
+## เธ•เธดเธ”เธ•เธฑเนเธเธขเนเธญ
+1. เธชเธฃเนเธฒเธ Supabase project เนเธซเธกเนเนเธฅเธฐเธฃเธฑเธ `supabase/schema.sql`
+2. เธชเธฃเนเธฒเธเธเธนเนเนเธเนเธเธเนเธฃเธเนเธ Supabase Authentication เนเธฅเนเธงเธฃเธฑเธ `update profiles set system_role='super_admin' where id='USER_UUID';`
+3. เธ•เธฑเนเธ `.env.local` เธ•เธฒเธก `.env.example`
+4. `npm install && npm run dev`
+5. เธ•เธฑเนเธ Microsoft Entra app เนเธฅเธฐ SharePoint Drive ID เธ•เธฒเธก `docs/DEPLOYMENT.md`
+
+## เธซเธกเธฒเธขเน€เธซเธ•เธธ
+- Admin CRUD Auth เธ—เธณเธเนเธฒเธ server API เนเธฅเธฐ service role เนเธกเนเธ–เธนเธเธชเนเธเนเธเน€เธเธฃเธฒเธงเนเน€เธเธญเธฃเน
+- PDF เธเธเธฑเธเธญเธเธธเธกเธฑเธ•เธดเธ–เธนเธเธญเธฑเธเนเธซเธฅเธ”เนเธ SharePoint เธเธฃเนเธญเธก SHA-256 metadata เนเธ Supabase
+- pdf-lib เธเธฑเธเธ—เธถเธเธ”เนเธงเธข object streams เน€เธเธทเนเธญเธฅเธ” overhead เนเธ•เนเนเธกเน recompress เธฃเธนเธเน€เธ”เธดเธกเธ—เธฑเนเธเธซเธกเธ”
+- MVP เนเธชเธ”เธ PDF เธ”เนเธงเธข browser PDF viewer เน€เธเธทเนเธญเธฃเธญเธเธฃเธฑเธ deployment เน€เธชเธ–เธตเธขเธฃ เธชเนเธงเธ signature overlay เธฅเธฒเธเธญเธดเธชเธฃเธฐเธเธเธซเธเนเธฒเนเธฃเธ; production เธเธฑเนเธเธ–เธฑเธ”เนเธเธเธงเธฃเน€เธเธดเนเธก PDF.js page canvas เนเธฅเธฐ page selector เธชเธณเธซเธฃเธฑเธเธ—เธธเธเธซเธเนเธฒ
+
+
+============================================================
+FILE: app/api/admin/users/[id]/route.js
+============================================================
+
+
+============================================================
+FILE: app/api/admin/users/route.js
+============================================================
+
+import {admin,requireAdmin,apiError} from '../../../../lib/server-auth'
+export async function GET(req){try{await requireAdmin(req);const {data,error}=await admin.from('profiles').select('*,position:positions(*)').order('full_name');if(error)throw error;return Response.json(data)}catch(e){return apiError(e)}}
+export async function POST(req){try{const actor=await requireAdmin(req),b=await req.json();if(!b.email||!b.password||!b.full_name) return Response.json({error:'เธเนเธญเธกเธนเธฅเนเธกเนเธเธฃเธ'},{status:400});const {data,error}=await admin.auth.admin.createUser({email:b.email,password:b.password,email_confirm:true,user_metadata:{full_name:b.full_name}});if(error)throw error;const {error:pe}=await admin.from('profiles').update({full_name:b.full_name,system_role:b.system_role||'user',position_id:b.position_id||null,is_active:true,can_review:!!b.can_review,can_approve:!!b.can_approve}).eq('id',data.user.id);if(pe)throw pe;await admin.from('audit_logs').insert({actor_id:actor.id,action:'user.created',entity_type:'user',entity_id:data.user.id,details:{email:b.email}});return Response.json({id:data.user.id},{status:201})}catch(e){return apiError(e)}}
+
+
+============================================================
+FILE: app/api/sharepoint/upload/route.js
+============================================================
+
+import {admin,requireUser,apiError} from '../../../../lib/server-auth'
+async function token(){const body=new URLSearchParams({client_id:process.env.MICROSOFT_CLIENT_ID,client_secret:process.env.MICROSOFT_CLIENT_SECRET,scope:'https://graph.microsoft.com/.default',grant_type:'client_credentials'});const r=await fetch(`https://login.microsoftonline.com/${process.env.MICROSOFT_TENANT_ID}/oauth2/v2.0/token`,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});const j=await r.json();if(!r.ok)throw new Error(j.error_description||'เธเธญ Microsoft token เนเธกเนเธชเธณเน€เธฃเนเธ');return j.access_token}
+const clean=s=>s.replace(/["*:<>?/\|#%]/g,'_')
+export async function POST(req){try{const user=await requireUser(req);if(!process.env.SHAREPOINT_DRIVE_ID)throw new Error('เธขเธฑเธเนเธกเนเนเธ”เนเธ•เธฑเนเธเธเนเธฒ SHAREPOINT_DRIVE_ID');const docId=req.headers.get('x-document-id'),name=clean(decodeURIComponent(req.headers.get('x-file-name')||'signed.pdf')),bytes=await req.arrayBuffer();if(!docId||!bytes.byteLength)return Response.json({error:'เนเธกเนเธกเธตเนเธเธฅเนเธซเธฃเธทเธญ Document ID'},{status:400});const {data:doc}=await admin.from('documents').select('id,status').eq('id',docId).single();if(!doc||doc.status!=='approved')return Response.json({error:'เน€เธญเธเธชเธฒเธฃเธ•เนเธญเธเธญเธเธธเธกเธฑเธ•เธดเธเธฃเธเธเนเธญเธเธเธฑเธ”เน€เธเนเธ'},{status:409});const access=await token(),folder=(process.env.SHAREPOINT_FOLDER_PATH||'SignedDocuments').replace(/^\/+|\/+$/g,''),path=`${folder}/${name}`;let item;if(bytes.byteLength<=250*1024*1024){const r=await fetch(`https://graph.microsoft.com/v1.0/drives/${process.env.SHAREPOINT_DRIVE_ID}/root:/${encodeURI(path)}:/content`,{method:'PUT',headers:{Authorization:`Bearer ${access}`,'Content-Type':'application/pdf'},body:bytes});item=await r.json();if(!r.ok)throw new Error(item.error?.message||'Upload SharePoint เนเธกเนเธชเธณเน€เธฃเนเธ')}else throw new Error('เนเธเธฅเนเน€เธเธดเธ 250 MB เธเธฃเธธเธ“เธฒเนเธเน upload session');const hash=await crypto.subtle.digest('SHA-256',bytes);const sha256=Array.from(new Uint8Array(hash)).map(x=>x.toString(16).padStart(2,'0')).join('');await admin.from('document_archives').insert({document_id:docId,drive_id:process.env.SHAREPOINT_DRIVE_ID,item_id:item.id,web_url:item.webUrl,file_name:item.name,file_size:item.size,sha256,archived_by:user.id});await admin.from('documents').update({status:'archived'}).eq('id',docId);return Response.json({ok:true,webUrl:item.webUrl,itemId:item.id,sha256})}catch(e){return apiError(e)}}
+
+
+============================================================
+FILE: app/globals.css
+============================================================
+
+:root{--navy:#102a4c;--blue:#16728b;--gold:#d9a12e;--bg:#f4f7fb;--line:#dce4ed;--muted:#6b7a8f}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:#17243a;font-family:"Segoe UI",Tahoma,sans-serif}button,input,select,textarea{font:inherit}button{cursor:pointer}header{height:72px;padding:0 max(18px,calc((100% - 1240px)/2));display:flex;align-items:center;justify-content:space-between;background:#fff;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:9}.brand{display:flex;gap:11px;align-items:center}.brand i{width:42px;height:42px;display:grid;place-items:center;border-radius:50%;background:var(--gold);color:#fff;font-style:normal;font-weight:800}.brand small,.row small,.userrow small,.step small{display:block;color:var(--muted);margin-top:3px}nav{display:flex;gap:4px}nav button{border:0;background:transparent;padding:9px;color:#46566c}main{max-width:1240px;margin:auto;padding:32px 20px 60px}.login{min-height:100vh;display:grid;grid-template-columns:1.2fr .8fr;place-items:center;max-width:950px;margin:auto;gap:60px}.login h1{font-size:48px}.login em{color:var(--blue);font-style:normal}.login form{background:#fff;border:1px solid var(--line);border-radius:18px;padding:35px;width:100%}.login form small{display:block;color:var(--muted);margin-top:16px}.eyebrow{font-size:12px;letter-spacing:1.7px;color:var(--blue);font-weight:800}.top{display:flex;justify-content:space-between;align-items:center}.top h1{font-size:34px}.card{background:#fff;border:1px solid var(--line);border-radius:15px;padding:20px;box-shadow:0 8px 30px #18324f08}.primary,.ghost,.danger,.approve{border:0;border-radius:8px;padding:10px 14px;font-weight:750}.primary{background:var(--navy);color:#fff}.ghost{background:#eef2f6;color:#34455d}.danger{background:#ffe4e6;color:#a33b44}.approve{background:#17734b;color:#fff}.full{width:100%;margin-top:9px}label{display:block;font-size:13px;font-weight:700;margin:14px 0 5px}input,select,textarea{width:100%;padding:10px 11px;border:1px solid #cbd6e3;border-radius:8px;background:#fff}.check{display:flex;gap:8px;align-items:center}.check input{width:auto}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:13px;margin:22px 0}.stats b{background:#fff;border:1px solid var(--line);border-radius:13px;padding:18px;font-size:25px}.stats small{display:block;font-size:12px;color:var(--muted);margin-top:5px}.list{padding:0;overflow:hidden}.row{display:flex;width:100%;align-items:center;gap:14px;text-align:left;border:0;border-bottom:1px solid #edf1f5;background:#fff;padding:15px 18px}.row>span:nth-child(2){flex:1}.pdf{background:#fff0ef;color:#cb473b;padding:10px 7px;border-radius:7px;font-size:10px;font-weight:900}.status{font-style:normal;font-size:11px;font-weight:800;padding:5px 8px;border-radius:99px;background:#e9eef4}.status.in_review,.status.submitted{background:#fff1ca;color:#8e6305}.status.approved{background:#dff5e8;color:#167047}.status.archived{background:#dcecff;color:#275c9d}.empty{text-align:center;padding:55px;color:var(--muted)}.adminGrid{display:grid;grid-template-columns:360px 1fr;gap:18px}.table{max-height:75vh;overflow:auto}.userrow{display:flex;align-items:center;gap:8px;border-bottom:1px solid #edf1f5;padding:12px 0}.userrow span,.userrow b{flex:1}.narrow{max-width:750px;margin:auto}.inline{display:flex;gap:8px;align-items:end}.inline>*{margin-top:0}.template{border-bottom:1px solid var(--line);padding:12px 0}fieldset{border:1px solid var(--line);border-radius:10px;margin:12px 0}.viewer{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:18px}.pdfstage{background:#cfd8e1;border-radius:14px;padding:24px;min-height:75vh;overflow:auto}.paper{position:relative;width:100%;height:76vh;background:#fff}.paper iframe{width:100%;height:100%;border:0}.overlay{position:absolute;object-fit:contain;border:2px dashed var(--blue);touch-action:none;cursor:move;background:#fff8}.viewer aside{display:grid;gap:13px;align-content:start}.step{border-left:3px solid var(--gold);padding:8px 10px;margin:8px 0}.sig{width:100%;height:140px;border:1px dashed #9cacbd;border-radius:8px;touch-action:none}.hint{font-size:12px;color:var(--muted)}.back{border:0;background:transparent;color:var(--blue);font-weight:800;margin-bottom:12px}.modal{position:fixed;inset:0;background:#10223a99;display:grid;place-items:center;z-index:20;padding:15px}.modal>div{background:#fff;border-radius:16px;padding:25px;width:min(520px,100%)}.toast{position:fixed;right:20px;bottom:20px;background:#133b37;color:#fff;padding:12px 16px;border-radius:9px;z-index:30}.center{display:grid;place-items:center;min-height:80vh}@media(max-width:850px){.login,.adminGrid,.viewer{grid-template-columns:1fr}.login{padding:25px}.login h1{font-size:36px}.stats{grid-template-columns:1fr 1fr}.viewer aside{grid-row:1}header{height:auto;padding:10px 14px;align-items:start}nav{flex-wrap:wrap;justify-content:flex-end}.brand small{display:none}}@media(max-width:520px){main{padding:22px 11px}.status{display:none}.top{align-items:start}.brand b{font-size:13px}.stats{gap:7px}.paper{height:60vh}}
+
+
+============================================================
+FILE: app/layout.js
+============================================================
+
+import './globals.css'
+export const metadata={title:'เธฃเธฐเธเธเธ•เธฃเธงเธเธชเธญเธเนเธฅเธฐเธฅเธเธเธฒเธกเน€เธญเธเธชเธฒเธฃ',description:'เธจเธนเธเธขเนเธเธฒเธฃเธจเธถเธเธฉเธฒเธเธดเน€เธจเธฉเธเธฑเธเธซเธงเธฑเธ”เธฅเธณเธเธนเธ'}
+export default function Layout({children}){return <html lang="th"><body>{children}</body></html>}
+
+
+============================================================
+FILE: app/page.js
+============================================================
+
+'use client'
+import {useEffect,useRef,useState} from 'react'
+import {supabase} from '../lib/supabase-browser'
+import {PDFDocument} from 'pdf-lib'
+import SignaturePad from 'signature_pad'
+
+const S={draft:'เธเธเธฑเธเธฃเนเธฒเธ',submitted:'เธชเนเธเนเธฅเนเธง',in_review:'เธเธณเธฅเธฑเธเธ•เธฃเธงเธ',changes_requested:'เธเธญเนเธเนเนเธ',approved:'เธญเธเธธเธกเธฑเธ•เธดเธเธฃเธ',archived:'เธเธฑเธ”เน€เธเนเธเนเธฅเนเธง'}
+const emptyUser={email:'',password:'',full_name:'',system_role:'user',position_id:'',can_review:false,can_approve:false}
+export default function App(){const [session,setSession]=useState(null),[profile,setProfile]=useState(null),[view,setView]=useState('docs'),[docs,setDocs]=useState([]),[users,setUsers]=useState([]),[positions,setPositions]=useState([]),[workflows,setWorkflows]=useState([]),[current,setCurrent]=useState(null),[msg,setMsg]=useState('')
+ useEffect(()=>{supabase.auth.getSession().then(x=>setSession(x.data.session));const {data}=supabase.auth.onAuthStateChange((_,s)=>setSession(s));return()=>data.subscription.unsubscribe()},[])
+ useEffect(()=>{if(session)loadAll();else setProfile(null)},[session])
+ async function loadAll(){const uid=session.user.id;const [p,d,pos,w]=await Promise.all([supabase.from('profiles').select('*,position:positions(*)').eq('id',uid).single(),supabase.from('documents').select('*,owner:profiles!documents_owner_id_fkey(full_name),workflow:document_workflows(id,current_step,status,steps:document_workflow_steps(*,assignees:workflow_step_assignees(*,user:profiles(full_name))))').order('created_at',{ascending:false}),supabase.from('positions').select('*').order('sort_order'),supabase.from('workflow_templates').select('*,steps:workflow_template_steps(*)').eq('is_active',true)]);setProfile(p.data);setDocs(d.data||[]);setPositions(pos.data||[]);setWorkflows(w.data||[])}
+ const token=()=>session?.access_token
+ async function adminUsers(){const r=await fetch('/api/admin/users',{headers:{Authorization:`Bearer ${token()}`}}),j=await r.json();if(!r.ok)return flash(j.error);setUsers(j);setView('admin')}
+ function flash(x){setMsg(x);setTimeout(()=>setMsg(''),3500)}
+ if(!session)return <Login flash={flash}/>
+ if(!profile)return <Screen>เธเธณเธฅเธฑเธเนเธซเธฅเธ”...</Screen>
+ return <><Header profile={profile} logout={()=>supabase.auth.signOut()} nav={setView} admin={['admin','super_admin'].includes(profile.system_role)} onAdmin={adminUsers}/>{msg&&<div className="toast">{msg}</div>}<main>{view==='admin'?<Admin users={users} positions={positions} token={token} reload={adminUsers} flash={flash}/>:view==='positions'?<Positions positions={positions} reload={loadAll} flash={flash}/>:view==='workflows'?<Templates templates={workflows} positions={positions} users={users} reload={loadAll} flash={flash}/>:current?<DocumentRoom doc={current} session={session} profile={profile} back={()=>{setCurrent(null);loadAll()}} flash={flash}/>:<Documents docs={docs} workflows={workflows} profile={profile} session={session} open={setCurrent} reload={loadAll} flash={flash}/>}</main></>
+}
+function Screen({children}){return <main className="center">{children}</main>}
+function Login({flash}){async function go(e){e.preventDefault();const f=new FormData(e.currentTarget),{error}=await supabase.auth.signInWithPassword({email:f.get('email'),password:f.get('password')});if(error)flash(error.message)}return <div className="login"><section><span className="eyebrow">DOCUMENT WORKFLOW</span><h1>เธฃเธฐเธเธเธ•เธฃเธงเธเธชเธญเธเนเธฅเธฐ<br/><em>เธฅเธเธเธฒเธกเน€เธญเธเธชเธฒเธฃ</em></h1><p>เธจเธนเธเธขเนเธเธฒเธฃเธจเธถเธเธฉเธฒเธเธดเน€เธจเธฉเธเธฑเธเธซเธงเธฑเธ”เธฅเธณเธเธนเธ</p></section><form onSubmit={go}><h2>เน€เธเนเธฒเธชเธนเนเธฃเธฐเธเธ</h2><label>เธญเธตเน€เธกเธฅ<input name="email" type="email" required/></label><label>เธฃเธซเธฑเธชเธเนเธฒเธ<input name="password" type="password" required/></label><button className="primary">เน€เธเนเธฒเธชเธนเนเธฃเธฐเธเธ</button><small>เธเธฑเธเธเธตเธเธนเนเนเธเนเธชเธฃเนเธฒเธเนเธ”เธขเธเธนเนเธ”เธนเนเธฅเธฃเธฐเธเธ</small></form></div>}
+function Header({profile,logout,nav,admin,onAdmin}){return <header><div className="brand"><i>เธจเธจ</i><div><b>เธฃเธฐเธเธเน€เธญเธเธชเธฒเธฃเธญเธดเน€เธฅเนเธเธ—เธฃเธญเธเธดเธเธชเน</b><small>{profile.full_name} โ€ข {profile.position?.name||'เนเธกเนเธฃเธฐเธเธธเธ•เธณเนเธซเธเนเธ'}</small></div></div><nav><button onClick={()=>nav('docs')}>เน€เธญเธเธชเธฒเธฃ</button>{admin&&<><button onClick={onAdmin}>เธเธนเนเนเธเน</button><button onClick={()=>nav('positions')}>เธ•เธณเนเธซเธเนเธ</button><button onClick={()=>nav('workflows')}>Workflow</button></>}<button onClick={logout}>เธญเธญเธเธเธฒเธเธฃเธฐเธเธ</button></nav></header>}
+function Documents({docs,workflows,session,open,reload,flash}){const [show,setShow]=useState(false);async function upload(e){e.preventDefault();const f=new FormData(e.currentTarget),file=f.get('file');if(file.type!=='application/pdf')return flash('เธเธฃเธธเธ“เธฒเน€เธฅเธทเธญเธ PDF');const id=crypto.randomUUID(),path=`${session.user.id}/${id}.pdf`;let r=await supabase.storage.from('documents').upload(path,file,{contentType:'application/pdf'});if(r.error)return flash(r.error.message);r=await supabase.from('documents').insert({id,title:f.get('title'),description:f.get('description'),file_path:path,file_name:file.name,file_size:file.size,owner_id:session.user.id,status:'submitted'});if(r.error)return flash(r.error.message);const template=f.get('template');if(template)await supabase.rpc('instantiate_workflow',{p_document_id:id,p_template_id:template});setShow(false);flash('เธญเธฑเธเนเธซเธฅเธ”เนเธฅเธฐเธชเธฃเนเธฒเธ Workflow เนเธฅเนเธง');reload()}return <><div className="top"><div><span className="eyebrow">DOCUMENT CENTER</span><h1>เน€เธญเธเธชเธฒเธฃเธ—เธฑเนเธเธซเธกเธ”</h1></div><button className="primary" onClick={()=>setShow(true)}>๏ผ เน€เธญเธเธชเธฒเธฃเนเธซเธกเน</button></div><div className="stats"><b>{docs.length}<small>เธ—เธฑเนเธเธซเธกเธ”</small></b><b>{docs.filter(x=>x.status==='in_review').length}<small>เธเธณเธฅเธฑเธเธ•เธฃเธงเธ</small></b><b>{docs.filter(x=>x.status==='approved').length}<small>เธญเธเธธเธกเธฑเธ•เธดเธเธฃเธ</small></b><b>{docs.filter(x=>x.status==='archived').length}<small>เธเธฑเธ”เน€เธเนเธเนเธฅเนเธง</small></b></div><section className="card list">{docs.map(d=><button className="row" key={d.id} onClick={()=>open(d)}><span className="pdf">PDF</span><span><b>{d.title}</b><small>{d.owner?.full_name} โ€ข {new Date(d.created_at).toLocaleDateString('th-TH')}</small></span><em className={'status '+d.status}>{S[d.status]||d.status}</em><strong>โ€บ</strong></button>)}{!docs.length&&<div className="empty">เธขเธฑเธเนเธกเนเธกเธตเน€เธญเธเธชเธฒเธฃ</div>}</section>{show&&<Modal close={()=>setShow(false)}><form onSubmit={upload}><h2>เน€เธเธดเนเธกเน€เธญเธเธชเธฒเธฃ</h2><label>เธเธทเนเธญเน€เธญเธเธชเธฒเธฃ<input name="title" required/></label><label>เธฃเธฒเธขเธฅเธฐเน€เธญเธตเธขเธ”<textarea name="description"/></label><label>Workflow<select name="template" required><option value="">เน€เธฅเธทเธญเธ Workflow</option>{workflows.map(x=><option value={x.id} key={x.id}>{x.name}</option>)}</select></label><label>เนเธเธฅเน PDF<input name="file" type="file" accept="application/pdf" required/></label><button className="primary full">เธญเธฑเธเนเธซเธฅเธ”เนเธฅเธฐเธชเนเธเธ•เธฃเธงเธ</button></form></Modal>}</>}
+function Admin({users,positions,token,reload,flash}){const [form,setForm]=useState(emptyUser),[edit,setEdit]=useState(null);async function save(e){e.preventDefault();const method=edit?'PATCH':'POST',url=edit?`/api/admin/users/${edit}`:'/api/admin/users',r=await fetch(url,{method,headers:{'Content-Type':'application/json',Authorization:`Bearer ${token()}`},body:JSON.stringify(form)}),j=await r.json();if(!r.ok)return flash(j.error);setForm(emptyUser);setEdit(null);flash('เธเธฑเธเธ—เธถเธเธเธนเนเนเธเนเนเธฅเนเธง');reload()}async function del(id){if(!confirm('เธขเธทเธเธขเธฑเธเธเธฒเธฃเธฅเธเธเธฑเธเธเธต?'))return;const r=await fetch(`/api/admin/users/${id}`,{method:'DELETE',headers:{Authorization:`Bearer ${token()}`}}),j=await r.json();if(!r.ok)return flash(j.error);reload()}function pick(u){setEdit(u.id);setForm({email:'',password:'',full_name:u.full_name,system_role:u.system_role,position_id:u.position_id||'',can_review:u.can_review,can_approve:u.can_approve})}return <><div className="top"><h1>เธเธฑเธ”เธเธฒเธฃเธเธนเนเนเธเนเธเธฒเธ</h1></div><div className="adminGrid"><section className="card"><h2>{edit?'เนเธเนเนเธเธเธนเนเนเธเน':'เน€เธเธดเนเธกเธเธนเนเนเธเน'}</h2><form onSubmit={save}><label>เธเธทเนเธญ-เธเธฒเธกเธชเธเธธเธฅ<input value={form.full_name} onChange={e=>setForm({...form,full_name:e.target.value})} required/></label>{!edit&&<><label>เธญเธตเน€เธกเธฅ<input type="email" value={form.email} onChange={e=>setForm({...form,email:e.target.value})} required/></label><label>เธฃเธซเธฑเธชเธเนเธฒเธเน€เธฃเธดเนเธกเธ•เนเธ<input type="password" minLength="8" value={form.password} onChange={e=>setForm({...form,password:e.target.value})} required/></label></>}<label>เธ•เธณเนเธซเธเนเธ<select value={form.position_id} onChange={e=>setForm({...form,position_id:e.target.value})}><option value="">เนเธกเนเธฃเธฐเธเธธ</option>{positions.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select></label><label>เธชเธดเธ—เธเธดเนเธฃเธฐเธเธ<select value={form.system_role} onChange={e=>setForm({...form,system_role:e.target.value})}><option value="user">เธเธนเนเนเธเน</option><option value="admin">เนเธญเธ”เธกเธดเธ</option><option value="super_admin">Super Admin</option></select></label><label className="check"><input type="checkbox" checked={form.can_review} onChange={e=>setForm({...form,can_review:e.target.checked})}/> เธ•เธฃเธงเธเน€เธญเธเธชเธฒเธฃเนเธ”เน</label><label className="check"><input type="checkbox" checked={form.can_approve} onChange={e=>setForm({...form,can_approve:e.target.checked})}/> เธญเธเธธเธกเธฑเธ•เธดเนเธ”เน</label><button className="primary full">เธเธฑเธเธ—เธถเธ</button>{edit&&<button type="button" className="ghost full" onClick={()=>{setEdit(null);setForm(emptyUser)}}>เธขเธเน€เธฅเธดเธ</button>}</form></section><section className="card table"><h2>เธเธฑเธเธเธตเธ—เธฑเนเธเธซเธกเธ”</h2>{users.map(u=><div className="userrow" key={u.id}><span><b>{u.full_name}</b><small>{u.position?.name||'เนเธกเนเธฃเธฐเธเธธเธ•เธณเนเธซเธเนเธ'} โ€ข {u.system_role} โ€ข {u.is_active?'เนเธเนเธเธฒเธ':'เธฃเธฐเธเธฑเธ'}</small></span><button onClick={()=>pick(u)}>เนเธเนเนเธ</button><button className="danger" onClick={()=>del(u.id)}>เธฅเธ</button></div>)}</section></div></>}
+function Positions({positions,reload,flash}){const [name,setName]=useState('');async function add(e){e.preventDefault();const {error}=await supabase.from('positions').insert({name});if(error)return flash(error.message);setName('');reload()}async function remove(id){const {error}=await supabase.from('positions').delete().eq('id',id);if(error)flash(error.message);else reload()}return <section className="card narrow"><h1>เธ•เธณเนเธซเธเนเธเนเธเธญเธเธเนเธเธฃ</h1><form className="inline" onSubmit={add}><input value={name} onChange={e=>setName(e.target.value)} placeholder="เธเธทเนเธญเธ•เธณเนเธซเธเนเธเนเธซเธกเน" required/><button className="primary">เน€เธเธดเนเธก</button></form>{positions.map(p=><div className="userrow" key={p.id}><b>{p.name}</b><button className="danger" onClick={()=>remove(p.id)}>เธฅเธ</button></div>)}</section>}
+function Templates({templates,positions,reload,flash}){const [name,setName]=useState(''),[steps,setSteps]=useState([{name:'เธซเธฑเธงเธซเธเนเธฒเธเนเธฒเธขเธ•เธฃเธงเธเธชเธญเธ',assignee_type:'position',position_id:'',approval_mode:'any',requires_signature:false}]);async function save(e){e.preventDefault();const {data,error}=await supabase.from('workflow_templates').insert({name}).select().single();if(error)return flash(error.message);for(let i=0;i<steps.length;i++)await supabase.from('workflow_template_steps').insert({...steps[i],template_id:data.id,step_order:i+1,position_id:steps[i].position_id||null});flash('เธชเธฃเนเธฒเธ Workflow เนเธฅเนเธง');setName('');reload()}return <div className="adminGrid"><section className="card"><h2>เธชเธฃเนเธฒเธ Workflow</h2><form onSubmit={save}><label>เธเธทเนเธญ Workflow<input value={name} onChange={e=>setName(e.target.value)} required/></label>{steps.map((s,i)=><fieldset key={i}><legend>เธเธฑเนเธเธ—เธตเน {i+1}</legend><input value={s.name} onChange={e=>{let a=[...steps];a[i].name=e.target.value;setSteps(a)}}/><select value={s.position_id} onChange={e=>{let a=[...steps];a[i].position_id=e.target.value;setSteps(a)}} required><option value="">เน€เธฅเธทเธญเธเธ•เธณเนเธซเธเนเธเธเธนเนเธ•เธฃเธงเธ</option>{positions.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}</select><label className="check"><input type="checkbox" checked={s.requires_signature} onChange={e=>{let a=[...steps];a[i].requires_signature=e.target.checked;setSteps(a)}}/> เธ•เนเธญเธเธฅเธเธฅเธฒเธขเน€เธเนเธ</label></fieldset>)}<button type="button" className="ghost" onClick={()=>setSteps([...steps,{name:'เธเธฑเนเธเธ•เธญเธเนเธซเธกเน',assignee_type:'position',position_id:'',approval_mode:'any',requires_signature:false}])}>๏ผ เน€เธเธดเนเธกเธเธฑเนเธ</button><button className="primary full">เธเธฑเธเธ—เธถเธ Workflow</button></form></section><section className="card"><h2>Workflow เธ—เธตเนเธกเธต</h2>{templates.map(t=><div className="template" key={t.id}><b>{t.name}</b><ol>{t.steps?.sort((a,b)=>a.step_order-b.step_order).map(s=><li key={s.id}>{s.name}{s.requires_signature?' โ€ข เธ•เนเธญเธเน€เธเนเธ':''}</li>)}</ol></div>)}</section></div>}
+function DocumentRoom({doc,session,profile,back,flash}){const [url,setUrl]=useState(''),[signing,setSigning]=useState(false),[data,setData]=useState(null),[box,setBox]=useState({x:65,y:75,w:22,h:10}),drag=useRef(null);useEffect(()=>{supabase.storage.from('documents').createSignedUrl(doc.file_path,1800).then(x=>setUrl(x.data?.signedUrl||''))},[doc]);const assigned=doc.workflow?.[0]?.steps?.some(s=>s.status==='active'&&s.assignees?.some(a=>a.user_id===session.user.id));async function action(type){const {error}=await supabase.rpc('act_on_workflow',{p_document_id:doc.id,p_action:type,p_comment:''});if(error)flash(error.message);else{flash('เธเธฑเธเธ—เธถเธเธเธฒเธฃเธ”เธณเน€เธเธดเธเธเธฒเธฃเนเธฅเนเธง');back()}}async function place(){if(!data)return flash('เธเธฃเธธเธ“เธฒเธชเธฃเนเธฒเธเธฅเธฒเธขเน€เธเนเธ');const pdfBytes=await fetch(url).then(r=>r.arrayBuffer()),pdf=await PDFDocument.load(pdfBytes),page=pdf.getPages()[0],imgBytes=await fetch(data).then(r=>r.arrayBuffer()),img=await pdf.embedPng(imgBytes),pw=page.getWidth(),ph=page.getHeight(),w=pw*box.w/100,h=ph*box.h/100,x=pw*box.x/100,y=ph*(1-(box.y+box.h)/100);page.drawImage(img,{x,y,width:w,height:h});const out=await pdf.save({useObjectStreams:true});const file=new Blob([out],{type:'application/pdf'});const r=await fetch('/api/sharepoint/upload',{method:'POST',headers:{Authorization:`Bearer ${session.access_token}`,'Content-Type':'application/pdf','X-Document-Id':doc.id,'X-File-Name':encodeURIComponent('signed-'+doc.file_name)},body:file}),j=await r.json();if(!r.ok)return flash(j.error);flash('เธเธฑเธเธ—เธถเธ PDF เธฅเธ SharePoint เนเธฅเนเธง');window.open(j.webUrl,'_blank');back()}function down(e){drag.current={sx:e.clientX,sy:e.clientY,x:box.x,y:box.y};e.currentTarget.setPointerCapture(e.pointerId)}function move(e){if(!drag.current)return;const rect=e.currentTarget.parentElement.getBoundingClientRect();setBox({...box,x:Math.max(0,Math.min(100-box.w,drag.current.x+(e.clientX-drag.current.sx)/rect.width*100)),y:Math.max(0,Math.min(100-box.h,drag.current.y+(e.clientY-drag.current.sy)/rect.height*100))})}return <><button className="back" onClick={back}>โ€น เธเธฅเธฑเธ</button><div className="viewer"><section className="pdfstage">{url?<div className="paper"><iframe src={url}/>{signing&&data&&<img className="overlay" src={data} style={{left:box.x+'%',top:box.y+'%',width:box.w+'%',height:box.h+'%'}} onPointerDown={down} onPointerMove={move} onPointerUp={()=>drag.current=null}/>}</div>:<div className="empty">เธเธณเธฅเธฑเธเนเธซเธฅเธ” PDF...</div>}</section><aside><section className="card"><em className={'status '+doc.status}>{S[doc.status]}</em><h2>{doc.title}</h2><p>{doc.description}</p></section><section className="card"><h3>เธเธฑเนเธเธ•เธญเธเธ•เธฃเธงเธเธชเธญเธ</h3>{doc.workflow?.[0]?.steps?.sort((a,b)=>a.step_order-b.step_order).map(s=><div className="step" key={s.id}><b>{s.step_order}. {s.name}</b><small>{s.status}</small></div>)}</section>{assigned&&<section className="card"><h3>เธเธฒเธฃเธ”เธณเน€เธเธดเธเธเธฒเธฃ</h3><button className="approve full" onClick={()=>action('approved')}>เธญเธเธธเธกเธฑเธ•เธดเธเธฑเนเธเธ•เธญเธ</button><button className="danger full" onClick={()=>action('rejected')}>เธชเนเธเธเธฅเธฑเธเนเธเนเนเธ</button></section>}<section className="card"><h3>เธฅเธเธฅเธฒเธขเน€เธเนเธ</h3><button className="primary full" onClick={()=>setSigning(true)}>เธชเธฃเนเธฒเธ/เธงเธฒเธเธฅเธฒเธขเน€เธเนเธ</button>{signing&&<Signature onData={setData}/>}<label>เธเธงเธฒเธกเธเธงเนเธฒเธ<input type="range" min="8" max="45" value={box.w} onChange={e=>setBox({...box,w:+e.target.value})}/></label><p className="hint">เธฅเธฒเธเธฅเธฒเธขเน€เธเนเธเธเธเธซเธเนเธฒเน€เธญเธเธชเธฒเธฃเนเธเธขเธฑเธเธ•เธณเนเธซเธเนเธเธ—เธตเนเธ•เนเธญเธเธเธฒเธฃ</p>{doc.status==='approved'&&<button className="approve full" onClick={place}>เธเธฑเธเธ—เธถเธ PDF เนเธ SharePoint</button>}</section></aside></div></>}
+function Signature({onData}){const ref=useRef(),pad=useRef();useEffect(()=>{pad.current=new SignaturePad(ref.current,{penColor:'#102a4c'});return()=>pad.current?.off()},[]);return <div><canvas ref={ref} className="sig"/><div className="inline"><button className="ghost" onClick={()=>pad.current.clear()}>เธฅเนเธฒเธ</button><button className="primary" onClick={()=>{if(!pad.current.isEmpty())onData(pad.current.toDataURL('image/png'))}}>เนเธเนเธฅเธฒเธขเน€เธเนเธเธเธตเน</button></div><label>เธซเธฃเธทเธญเธญเธฑเธเนเธซเธฅเธ” PNG<input type="file" accept="image/png" onChange={e=>{const r=new FileReader();r.onload=()=>onData(r.result);r.readAsDataURL(e.target.files[0])}}/></label></div>}
+function Modal({children,close}){return <div className="modal" onMouseDown={e=>e.target===e.currentTarget&&close()}><div>{children}<button className="ghost full" onClick={close}>เธเธดเธ”</button></div></div>}
+
+
+============================================================
+FILE: docs/DEPLOYMENT.md
+============================================================
+
+# Deployment checklist
+## Supabase
+Run schema.sql, create first Auth user, make super_admin, copy Project URL, publishable/anon key and service_role key.
+## Microsoft 365
+Create a SharePoint site and Document Library named SignedDocuments. Register an Entra ID app, create client secret, add Microsoft Graph Application permission Sites.ReadWrite.All, and grant admin consent. Get Site ID with GET /sites/{hostname}:/sites/{siteName}; list libraries with GET /sites/{siteId}/drives and copy the intended drive id.
+## Vercel
+Import GitHub repo, Framework Next.js, leave Output Directory blank. Add all variables from .env.example. Redeploy.
+## Security
+Never expose SUPABASE_SERVICE_ROLE_KEY or MICROSOFT_CLIENT_SECRET as NEXT_PUBLIC variables. Prefer certificate/federated credentials and Sites.Selected for production least privilege when available in the tenant governance model.
+
+
+============================================================
+FILE: lib/server-auth.js
+============================================================
+
+import { createClient } from '@supabase/supabase-js'
+export const admin = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  { auth: { persistSession: false, autoRefreshToken: false } }
+)
+export async function requireAdmin(req) {
+  const authorization = req.headers.get('authorization') || ''
+  const token = authorization.replace(/^Bearer\s+/i, '').trim()
+
+  if (!token) {
+    console.error('SERVER AUTH: Missing access token')
+    throw new Error('UNAUTHORIZED')
+  }
+
+  const {
+    data: { user },
+    error: userError,
+  } = await admin.auth.getUser(token)
+
+  if (userError || !user) {
+    console.error('SERVER AUTH: Invalid user token', {
+      message: userError?.message,
+    })
+    throw new Error('UNAUTHORIZED')
+  }
+
+  const {
+    data: profile,
+    error: profileError,
+  } = await admin
+    .from('profiles')
+    .select('id, system_role, is_active')
+    .eq('id', user.id)
+    .maybeSingle()
+
+  console.log('SERVER AUTH CHECK', {
+    authUserId: user.id,
+    email: user.email,
+    profileId: profile?.id,
+    systemRole: profile?.system_role,
+    isActive: profile?.is_active,
+    profileError: profileError?.message,
+  })
+
+  if (profileError) {
+    console.error('SERVER AUTH: Profile query failed', profileError)
+    throw new Error(`PROFILE_ERROR: ${profileError.message}`)
+  }
+
+  if (!profile) {
+    console.error('SERVER AUTH: Profile not found', {
+      authUserId: user.id,
+      email: user.email,
+    })
+    throw new Error('PROFILE_NOT_FOUND')
+  }
+
+  const allowedRoles = ['super_admin', 'admin']
+
+  if (
+    profile.is_active !== true ||
+    !allowedRoles.includes(profile.system_role)
+  ) {
+    console.error('SERVER AUTH: Permission denied', {
+      authUserId: user.id,
+      systemRole: profile.system_role,
+      isActive: profile.is_active,
+    })
+
+    throw new Error('FORBIDDEN')
+  }
+
+  return {
+    user,
+    profile,
+  }
+}
+export async function requireUser (req) {
+  const token = (req.headers.get('authorization') || '').replace('Bearer ', '')
+  const {
+    data: { user },
+    error
+  } = await admin.auth.getUser(token)
+  if (error || !user) throw new Error('UNAUTHORIZED')
+  return user
+}
+export function apiError (e) {
+  const s =
+    e.message === 'UNAUTHORIZED' ? 401 : e.message === 'FORBIDDEN' ? 403 : 500
+  return Response.json(
+    { error: s === 500 ? e.message : 'เนเธกเนเธกเธตเธชเธดเธ—เธเธดเนเนเธเนเธเธฒเธ' },
+    { status: s }
+  )
+}
+
+
+============================================================
+FILE: lib/supabase-browser.js
+============================================================
+
+import {createClient} from '@supabase/supabase-js'
+export const supabase=createClient(process.env.NEXT_PUBLIC_SUPABASE_URL,process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY)
+
+
+============================================================
+FILE: package-lock.json
+============================================================
+
+{
+  "name": "document-workflow-enterprise",
+  "version": "2.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "": {
+      "name": "document-workflow-enterprise",
+      "version": "2.0.0",
+      "dependencies": {
+        "@supabase/supabase-js": "^2.79.0",
+        "next": "^16.0.0",
+        "pdf-lib": "^1.17.1",
+        "pdfjs-dist": "^6.3.289",
+        "react": "^19.0.0",
+        "react-dom": "^19.0.0",
+        "signature_pad": "^5.1.2"
+      }
+    },
+    "node_modules/@emnapi/runtime": {
+      "version": "1.11.3",
+      "resolved": "https://registry.npmjs.org/@emnapi/runtime/-/runtime-1.11.3.tgz",
+      "integrity": "sha512-Xz4Tpyki7XyrpbUK1jR1AhdAdaXyhhY4lZ3neLodmhpuWfy2PAQN5B46sAiU4liOXGLkHypn/qU+jvfWSCYYLA==",
+      "license": "MIT",
+      "optional": true,
+      "dependencies": {
+        "tslib": "^2.4.0"
+      }
+    },
+    "node_modules/@img/colour": {
+      "version": "1.1.0",
+      "resolved": "https://registry.npmjs.org/@img/colour/-/colour-1.1.0.tgz",
+      "integrity": "sha512-Td76q7j57o/tLVdgS746cYARfSyxk8iEfRxewL9h4OMzYhbW4TAcppl0mT4eyqXddh6L/jwoM75mo7ixa/pCeQ==",
+      "license": "MIT",
+      "optional": true,
+      "engines": {
+        "node": ">=18"
+      }
+    },
+    "node_modules/@img/sharp-darwin-arm64": {
+      "version": "0.35.5",
+      "resolved": "https://registry.npmjs.org/@img/sharp-darwin-arm64/-/sharp-darwin-arm64-0.35.5.tgz",
+      "integrity": "sha512-QRUlFQ0WxvdWyqqG/WtI3iupfD5rBzmCHXSdPsY91sAtVtTo7Q4cb6zOccZ3gqEqkr0f1As1ehLqmEpDsRf+lg==",
+      "cpu": [
+        "arm64"
+      ],
+      "license": "Apache-2.0",
+      "optional": true,
+      "os": [
+        "darwin"
+      ],
+      "engines": {
+        "node": ">=20.9.0"
+      },
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      },
+      "optionalDependencies": {
+        "@img/sharp-libvips-darwin-arm64": "1.3.4"
+      }
+    },
+    "node_modules/@img/sharp-darwin-x64": {
+      "version": "0.35.5",
+      "resolved": "https://registry.npmjs.org/@img/sharp-darwin-x64/-/sharp-darwin-x64-0.35.5.tgz",
+      "integrity": "sha512-+BR255RhDlpygUpOc/Jdt1nT6DQ3XG/ERo5wbcdOf5Q320dKtPCKPLR1LJs9VGXRaMa8l1uUa0tkCNOXiAxZUw==",
+      "cpu": [
+        "x64"
+      ],
+      "license": "Apache-2.0",
+      "optional": true,
+      "os": [
+        "darwin"
+      ],
+      "engines": {
+        "node": ">=20.9.0"
+      },
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      },
+      "optionalDependencies": {
+        "@img/sharp-libvips-darwin-x64": "1.3.4"
+      }
+    },
+    "node_modules/@img/sharp-freebsd-wasm32": {
+      "version": "0.35.5",
+      "resolved": "https://registry.npmjs.org/@img/sharp-freebsd-wasm32/-/sharp-freebsd-wasm32-0.35.5.tgz",
+      "integrity": "sha512-Y/z91nEZ4uIBX5X3nfTovjU9lHNKFYbL2lpHCLVNmXQK03VIZvXBBt0KxbPGp2SdGSF+2mQU4e+hQaWOt86iAw==",
+      "license": "Apache-2.0",
+      "optional": true,
+      "os": [
+        "freebsd"
+      ],
+      "dependencies": {
+        "@img/sharp-wasm32": "0.35.5"
+      },
+      "engines": {
+        "node": ">=20.9.0"
+      },
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      }
+    },
+    "node_modules/@img/sharp-libvips-darwin-arm64": {
+      "version": "1.3.4",
+      "resolved": "https://registry.npmjs.org/@img/sharp-libvips-darwin-arm64/-/sharp-libvips-darwin-arm64-1.3.4.tgz",
+      "integrity": "sha512-5R89nBYiRdUlSWJxPhO+GVtaXzXSxKnRu/xqMn3KTA3L9EB9Oy/P+Nn2f2vlhPuUdy/Zusb2DarbyTpGCfEDuw==",
+      "cpu": [
+        "arm64"
+      ],
+      "license": "LGPL-3.0-or-later",
+      "optional": true,
+      "os": [
+        "darwin"
+      ],
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      }
+    },
+    "node_modules/@img/sharp-libvips-darwin-x64": {
+      "version": "1.3.4",
+      "resolved": "https://registry.npmjs.org/@img/sharp-libvips-darwin-x64/-/sharp-libvips-darwin-x64-1.3.4.tgz",
+      "integrity": "sha512-iR2OKH80yi0U+dUplyh3/xdpFvps6YkCwsXenIJxqxR1v9o+xtKTGbS9H7cps+2Vxjc8B1j96p75NmTGjIhtpQ==",
+      "cpu": [
+        "x64"
+      ],
+      "license": "LGPL-3.0-or-later",
+      "optional": true,
+      "os": [
+        "darwin"
+      ],
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      }
+    },
+    "node_modules/@img/sharp-libvips-linux-arm": {
+      "version": "1.3.4",
+      "resolved": "https://registry.npmjs.org/@img/sharp-libvips-linux-arm/-/sharp-libvips-linux-arm-1.3.4.tgz",
+      "integrity": "sha512-LmRtTsOHuvM2+wlO2Db37dx5MiZhB0FvSunciw48YjdOkZz9KAiRbm8ujeMOA1INqmei5NapFxYEK1D1ZSidmw==",
+      "cpu": [
+        "arm"
+      ],
+      "libc": [
+        "glibc"
+      ],
+      "license": "LGPL-3.0-or-later",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      }
+    },
+    "node_modules/@img/sharp-libvips-linux-arm64": {
+      "version": "1.3.4",
+      "resolved": "https://registry.npmjs.org/@img/sharp-libvips-linux-arm64/-/sharp-libvips-linux-arm64-1.3.4.tgz",
+      "integrity": "sha512-Y3dgX/6lE2QhQb+Gxy0WZxfg9MEm/JBjamZpS2IklP7xIQoKN4hzAm7KcMVGtaVDt3neE9OKBC7vAfonA/Lr1A==",
+      "cpu": [
+        "arm64"
+      ],
+      "libc": [
+        "glibc"
+      ],
+      "license": "LGPL-3.0-or-later",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      }
+    },
+    "node_modules/@img/sharp-libvips-linux-ppc64": {
+      "version": "1.3.4",
+      "resolved": "https://registry.npmjs.org/@img/sharp-libvips-linux-ppc64/-/sharp-libvips-linux-ppc64-1.3.4.tgz",
+      "integrity": "sha512-Le6boB8Tai0Nis+gIxIpKx68UDVVIqdR8Tin5Yf1z2LJJQLDJvCDRqRu+jC2qCoD+eIomonmOwB4smBRxfVpYQ==",
+      "cpu": [
+        "ppc64"
+      ],
+      "libc": [
+        "glibc"
+      ],
+      "license": "LGPL-3.0-or-later",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      }
+    },
+    "node_modules/@img/sharp-libvips-linux-riscv64": {
+      "version": "1.3.4",
+      "resolved": "https://registry.npmjs.org/@img/sharp-libvips-linux-riscv64/-/sharp-libvips-linux-riscv64-1.3.4.tgz",
+      "integrity": "sha512-aHkkIEHPRdQEegJN20MLmGtxYD9R2wQr3Cwpddnu5+YKMt6Uzax7S9h5gpZTo8wyrGuZSlfQ63OevL5mTyOC7Q==",
+      "cpu": [
+        "riscv64"
+      ],
+      "libc": [
+        "glibc"
+      ],
+      "license": "LGPL-3.0-or-later",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      }
+    },
+    "node_modules/@img/sharp-libvips-linux-s390x": {
+      "version": "1.3.4",
+      "resolved": "https://registry.npmjs.org/@img/sharp-libvips-linux-s390x/-/sharp-libvips-linux-s390x-1.3.4.tgz",
+      "integrity": "sha512-ra/mB6MikESDUO7Yg+Mi95bFBb9GsObURuhnOv3OqknjGe9sZrG8tCe9q0xSIGrtLgvgw0gKnFWcK4blSgQOuQ==",
+      "cpu": [
+        "s390x"
+      ],
+      "libc": [
+        "glibc"
+      ],
+      "license": "LGPL-3.0-or-later",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      }
+    },
+    "node_modules/@img/sharp-libvips-linux-x64": {
+      "version": "1.3.4",
+      "resolved": "https://registry.npmjs.org/@img/sharp-libvips-linux-x64/-/sharp-libvips-linux-x64-1.3.4.tgz",
+      "integrity": "sha512-GJ//SSXbnwSDes02umB3nDJLFcQzw8a18V8fyhqr6tV515tOEMdImjjxj1AoafMRz56F3PHgftnj1QEKSU1zkw==",
+      "cpu": [
+        "x64"
+      ],
+      "libc": [
+        "glibc"
+      ],
+      "license": "LGPL-3.0-or-later",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      }
+    },
+    "node_modules/@img/sharp-libvips-linuxmusl-arm64": {
+      "version": "1.3.4",
+      "resolved": "https://registry.npmjs.org/@img/sharp-libvips-linuxmusl-arm64/-/sharp-libvips-linuxmusl-arm64-1.3.4.tgz",
+      "integrity": "sha512-hvulFwtjUcagsis6BBxHwGFwWoNZjgYmULGVrZcyfNbjA8hKILbRxGg15/7w5HDyXHXUos/j6baAWqnCyQ2DWA==",
+      "cpu": [
+        "arm64"
+      ],
+      "libc": [
+        "musl"
+      ],
+      "license": "LGPL-3.0-or-later",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      }
+    },
+    "node_modules/@img/sharp-libvips-linuxmusl-x64": {
+      "version": "1.3.4",
+      "resolved": "https://registry.npmjs.org/@img/sharp-libvips-linuxmusl-x64/-/sharp-libvips-linuxmusl-x64-1.3.4.tgz",
+      "integrity": "sha512-6zXKeE/p39I1AmA3cJG35eyBGNqNddLnUXjhwBnsGjFPWqf5VKkDBEqaEkPDoTEtkxwi2vv8Tcr2mDyP4So7Fg==",
+      "cpu": [
+        "x64"
+      ],
+      "libc": [
+        "musl"
+      ],
+      "license": "LGPL-3.0-or-later",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      }
+    },
+    "node_modules/@img/sharp-linux-arm": {
+      "version": "0.35.5",
+      "resolved": "https://registry.npmjs.org/@img/sharp-linux-arm/-/sharp-linux-arm-0.35.5.tgz",
+      "integrity": "sha512-LEaXK2WdXVK5ykcw0buWyPMsmLLL2vpHLD6yrNSW+JGEL3BZPA4tpKN6iaMc4AxTTAoaX/sU1rOL51lcIz48ZQ==",
+      "cpu": [
+        "arm"
+      ],
+      "libc": [
+        "glibc"
+      ],
+      "license": "Apache-2.0",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">=20.9.0"
+      },
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      },
+      "optionalDependencies": {
+        "@img/sharp-libvips-linux-arm": "1.3.4"
+      }
+    },
+    "node_modules/@img/sharp-linux-arm64": {
+      "version": "0.35.5",
+      "resolved": "https://registry.npmjs.org/@img/sharp-linux-arm64/-/sharp-linux-arm64-0.35.5.tgz",
+      "integrity": "sha512-LYVx5JTsOM2CBzmxreh+nl64/3H6Xb09iSLknqH47z2T2DFFxDeFLP5y4dJwe6H7uGQlHPyEEtIqyo3DYsRwdQ==",
+      "cpu": [
+        "arm64"
+      ],
+      "libc": [
+        "glibc"
+      ],
+      "license": "Apache-2.0",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">=20.9.0"
+      },
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      },
+      "optionalDependencies": {
+        "@img/sharp-libvips-linux-arm64": "1.3.4"
+      }
+    },
+    "node_modules/@img/sharp-linux-ppc64": {
+      "version": "0.35.5",
+      "resolved": "https://registry.npmjs.org/@img/sharp-linux-ppc64/-/sharp-linux-ppc64-0.35.5.tgz",
+      "integrity": "sha512-QVxAAq8evVRI9ia2vqgwrmWucn5Dfv+JdWzj75pD8omHLPSP7f8p20O8jxzjCcuCEQEOtYOZUmX1hkiZ0kdevA==",
+      "cpu": [
+        "ppc64"
+      ],
+      "libc": [
+        "glibc"
+      ],
+      "license": "Apache-2.0",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">=20.9.0"
+      },
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      },
+      "optionalDependencies": {
+        "@img/sharp-libvips-linux-ppc64": "1.3.4"
+      }
+    },
+    "node_modules/@img/sharp-linux-riscv64": {
+      "version": "0.35.5",
+      "resolved": "https://registry.npmjs.org/@img/sharp-linux-riscv64/-/sharp-linux-riscv64-0.35.5.tgz",
+      "integrity": "sha512-LtdreXguaavKODPIfzJ4kffx7UNt1omwtK0rch4EBbbSTXPnxWmYSayXdLJw0fJzQ97kHt1gL/yh4tvU+nCyRQ==",
+      "cpu": [
+        "riscv64"
+      ],
+      "libc": [
+        "glibc"
+      ],
+      "license": "Apache-2.0",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">=20.9.0"
+      },
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      },
+      "optionalDependencies": {
+        "@img/sharp-libvips-linux-riscv64": "1.3.4"
+      }
+    },
+    "node_modules/@img/sharp-linux-s390x": {
+      "version": "0.35.5",
+      "resolved": "https://registry.npmjs.org/@img/sharp-linux-s390x/-/sharp-linux-s390x-0.35.5.tgz",
+      "integrity": "sha512-UZasTOFiYzotTsGOCu42BfUzP6Tu6Do/947iRm1RsLKvlllxwGcn4RN27LibGWceix4Y+Pmw3jsnTcCQIgWjqA==",
+      "cpu": [
+        "s390x"
+      ],
+      "libc": [
+        "glibc"
+      ],
+      "license": "Apache-2.0",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">=20.9.0"
+      },
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      },
+      "optionalDependencies": {
+        "@img/sharp-libvips-linux-s390x": "1.3.4"
+      }
+    },
+    "node_modules/@img/sharp-linux-x64": {
+      "version": "0.35.5",
+      "resolved": "https://registry.npmjs.org/@img/sharp-linux-x64/-/sharp-linux-x64-0.35.5.tgz",
+      "integrity": "sha512-SxFtLTeJInhAA9Q836kux2vZNeOBQEx658qvbboZScr0wIARym3IcGmW7KpVD5sbVg0Ojy+udFQdayYIZyoNog==",
+      "cpu": [
+        "x64"
+      ],
+      "libc": [
+        "glibc"
+      ],
+      "license": "Apache-2.0",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">=20.9.0"
+      },
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      },
+      "optionalDependencies": {
+        "@img/sharp-libvips-linux-x64": "1.3.4"
+      }
+    },
+    "node_modules/@img/sharp-linuxmusl-arm64": {
+      "version": "0.35.5",
+      "resolved": "https://registry.npmjs.org/@img/sharp-linuxmusl-arm64/-/sharp-linuxmusl-arm64-0.35.5.tgz",
+      "integrity": "sha512-9HbMclmI1zlNkFRs3z9/eBtDjfD0sGlrX1z6b1qwmiFY5ElDLh4BC0LPBdVp7z1DXFiKlIcznf+ZlsuZzLxQqg==",
+      "cpu": [
+        "arm64"
+      ],
+      "libc": [
+        "musl"
+      ],
+      "license": "Apache-2.0",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">=20.9.0"
+      },
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      },
+      "optionalDependencies": {
+        "@img/sharp-libvips-linuxmusl-arm64": "1.3.4"
+      }
+    },
+    "node_modules/@img/sharp-linuxmusl-x64": {
+      "version": "0.35.5",
+      "resolved": "https://registry.npmjs.org/@img/sharp-linuxmusl-x64/-/sharp-linuxmusl-x64-0.35.5.tgz",
+      "integrity": "sha512-4KOphqB035HrVdqLZfCgMzzERrQkkzOwRhl4OAkRO1YCldbaFjySXMaK534Mo0V+LndnlJk+sbUyLeU0ULyD1A==",
+      "cpu": [
+        "x64"
+      ],
+      "libc": [
+        "musl"
+      ],
+      "license": "Apache-2.0",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">=20.9.0"
+      },
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      },
+      "optionalDependencies": {
+        "@img/sharp-libvips-linuxmusl-x64": "1.3.4"
+      }
+    },
+    "node_modules/@img/sharp-wasm32": {
+      "version": "0.35.5",
+      "resolved": "https://registry.npmjs.org/@img/sharp-wasm32/-/sharp-wasm32-0.35.5.tgz",
+      "integrity": "sha512-Ptsga1su4tQx+LLF1ECS9U6nz5kmrXKo6XVbtR48Ke3ZRxxgaWBu7IDtEe1quo8hiupwm6WFqxVlXaSf7IINGQ==",
+      "license": "Apache-2.0 AND LGPL-3.0-or-later AND MIT",
+      "optional": true,
+      "dependencies": {
+        "@emnapi/runtime": "^1.11.3"
+      },
+      "engines": {
+        "node": ">=20.9.0"
+      },
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      }
+    },
+    "node_modules/@img/sharp-webcontainers-wasm32": {
+      "version": "0.35.5",
+      "resolved": "https://registry.npmjs.org/@img/sharp-webcontainers-wasm32/-/sharp-webcontainers-wasm32-0.35.5.tgz",
+      "integrity": "sha512-hfhF/FmoQyTUkA0bIKFOtw536BQSeBMe6BF6QyWlrPxT754+TFLaZ7sKKTfvvM0yJgKgaYTwnFCIZ/GuDw5SUA==",
+      "cpu": [
+        "wasm32"
+      ],
+      "license": "Apache-2.0",
+      "optional": true,
+      "dependencies": {
+        "@img/sharp-wasm32": "0.35.5"
+      },
+      "engines": {
+        "node": ">=20.9.0"
+      },
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      }
+    },
+    "node_modules/@img/sharp-win32-arm64": {
+      "version": "0.35.5",
+      "resolved": "https://registry.npmjs.org/@img/sharp-win32-arm64/-/sharp-win32-arm64-0.35.5.tgz",
+      "integrity": "sha512-X4t7g+7ZA5DKblCBEXGjUqqemj4vczING/5viFwAL8h4N3qYeyjwdCvRLHi4EdOUI+2Z7UFlp1VM+p/AuEtm6Q==",
+      "cpu": [
+        "arm64"
+      ],
+      "license": "Apache-2.0 AND LGPL-3.0-or-later",
+      "optional": true,
+      "os": [
+        "win32"
+      ],
+      "engines": {
+        "node": ">=20.9.0"
+      },
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      }
+    },
+    "node_modules/@img/sharp-win32-ia32": {
+      "version": "0.35.5",
+      "resolved": "https://registry.npmjs.org/@img/sharp-win32-ia32/-/sharp-win32-ia32-0.35.5.tgz",
+      "integrity": "sha512-5Zm82LoBc43nhwNybZlG7Y1KO//Zhsn306fQl29ZOuStHLGTo3BWL83q3cznX0poxSAMuYL1On/BHBxkBeKr6A==",
+      "cpu": [
+        "ia32"
+      ],
+      "license": "Apache-2.0 AND LGPL-3.0-or-later",
+      "optional": true,
+      "os": [
+        "win32"
+      ],
+      "engines": {
+        "node": "^20.9.0"
+      },
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      }
+    },
+    "node_modules/@img/sharp-win32-x64": {
+      "version": "0.35.5",
+      "resolved": "https://registry.npmjs.org/@img/sharp-win32-x64/-/sharp-win32-x64-0.35.5.tgz",
+      "integrity": "sha512-x76eH0vEiHlcMQu8Y8IenntaACtddpT6W0wmXtWrnKcnKI7ME5DdgqhAD6SEWOEl1v2zDvkZDhFA9KnURwpfqg==",
+      "cpu": [
+        "x64"
+      ],
+      "license": "Apache-2.0 AND LGPL-3.0-or-later",
+      "optional": true,
+      "os": [
+        "win32"
+      ],
+      "engines": {
+        "node": ">=20.9.0"
+      },
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      }
+    },
+    "node_modules/@napi-rs/canvas": {
+      "version": "1.1.0",
+      "resolved": "https://registry.npmjs.org/@napi-rs/canvas/-/canvas-1.1.0.tgz",
+      "integrity": "sha512-k+ph/D8H9GS8ZZ48okvHrKeJynkqAA1kMUZRuzRWNlQUDHXngq7oRaWMZBdmSfd9ZhVy9bwNKei/7wMboI/uMg==",
+      "license": "MIT",
+      "optional": true,
+      "workspaces": [
+        "e2e/*"
+      ],
+      "engines": {
+        "node": ">= 10"
+      },
+      "funding": {
+        "type": "github",
+        "url": "https://github.com/sponsors/Brooooooklyn"
+      },
+      "optionalDependencies": {
+        "@napi-rs/canvas-android-arm64": "1.1.0",
+        "@napi-rs/canvas-darwin-arm64": "1.1.0",
+        "@napi-rs/canvas-darwin-x64": "1.1.0",
+        "@napi-rs/canvas-linux-arm-gnueabihf": "1.1.0",
+        "@napi-rs/canvas-linux-arm64-gnu": "1.1.0",
+        "@napi-rs/canvas-linux-arm64-musl": "1.1.0",
+        "@napi-rs/canvas-linux-riscv64-gnu": "1.1.0",
+        "@napi-rs/canvas-linux-x64-gnu": "1.1.0",
+        "@napi-rs/canvas-linux-x64-musl": "1.1.0",
+        "@napi-rs/canvas-win32-arm64-msvc": "1.1.0",
+        "@napi-rs/canvas-win32-x64-msvc": "1.1.0"
+      }
+    },
+    "node_modules/@napi-rs/canvas-android-arm64": {
+      "version": "1.1.0",
+      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-android-arm64/-/canvas-android-arm64-1.1.0.tgz",
+      "integrity": "sha512-mKrSmRyhWK4q699Q1xthbZIZi7JBvLtsRNnOZAeFaLPOFT1yo8y82aRC2nNZbXTGJXU7fVDONgGQPr0vo3kerw==",
+      "cpu": [
+        "arm64"
+      ],
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "android"
+      ],
+      "engines": {
+        "node": ">= 10"
+      },
+      "funding": {
+        "type": "github",
+        "url": "https://github.com/sponsors/Brooooooklyn"
+      }
+    },
+    "node_modules/@napi-rs/canvas-darwin-arm64": {
+      "version": "1.1.0",
+      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-darwin-arm64/-/canvas-darwin-arm64-1.1.0.tgz",
+      "integrity": "sha512-iqwST4g0oH+x8VCpBIYh+MYokv/mVvkM+v9oJGB0d9A3P2qBh42ogJlVyWq9SpPCrAjS7tplMb1D3OIfxl+utw==",
+      "cpu": [
+        "arm64"
+      ],
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "darwin"
+      ],
+      "engines": {
+        "node": ">= 10"
+      },
+      "funding": {
+        "type": "github",
+        "url": "https://github.com/sponsors/Brooooooklyn"
+      }
+    },
+    "node_modules/@napi-rs/canvas-darwin-x64": {
+      "version": "1.1.0",
+      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-darwin-x64/-/canvas-darwin-x64-1.1.0.tgz",
+      "integrity": "sha512-jkeA8eVTxDum03LTvc32YJ28F6KB1U0gYwnWMfOAUQZvWWEh/kvONby4iWGJx3+Tw45UqMGMXjtw2GKNVZDhVg==",
+      "cpu": [
+        "x64"
+      ],
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "darwin"
+      ],
+      "engines": {
+        "node": ">= 10"
+      },
+      "funding": {
+        "type": "github",
+        "url": "https://github.com/sponsors/Brooooooklyn"
+      }
+    },
+    "node_modules/@napi-rs/canvas-linux-arm-gnueabihf": {
+      "version": "1.1.0",
+      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-linux-arm-gnueabihf/-/canvas-linux-arm-gnueabihf-1.1.0.tgz",
+      "integrity": "sha512-Y4YkKG1ijoqkgUdTEEBNG4k+2BK5bR5jGL6S56YxCXYPwGfUd5nED8/74xyc7z+bpixPasCjSYoP3xYPOIGNxw==",
+      "cpu": [
+        "arm"
+      ],
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">= 10"
+      },
+      "funding": {
+        "type": "github",
+        "url": "https://github.com/sponsors/Brooooooklyn"
+      }
+    },
+    "node_modules/@napi-rs/canvas-linux-arm64-gnu": {
+      "version": "1.1.0",
+      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-linux-arm64-gnu/-/canvas-linux-arm64-gnu-1.1.0.tgz",
+      "integrity": "sha512-dE/XthqYkiWcBVtKFlZbUXwAYfDuQGqDWixznipJNmevLGpprNnTVQZyftm1RZJudkIOn2EkzYZDMMETM08Row==",
+      "cpu": [
+        "arm64"
+      ],
+      "libc": [
+        "glibc"
+      ],
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">= 10"
+      },
+      "funding": {
+        "type": "github",
+        "url": "https://github.com/sponsors/Brooooooklyn"
+      }
+    },
+    "node_modules/@napi-rs/canvas-linux-arm64-musl": {
+      "version": "1.1.0",
+      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-linux-arm64-musl/-/canvas-linux-arm64-musl-1.1.0.tgz",
+      "integrity": "sha512-DqZ/CMcHlhU56pPjv9AP0h3U7MFQ5LzC1HzMyRMotL+PFsJmZJA/ziApPYVyyz78DaVLhI8t3So3ztqtijbYpg==",
+      "cpu": [
+        "arm64"
+      ],
+      "libc": [
+        "musl"
+      ],
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">= 10"
+      },
+      "funding": {
+        "type": "github",
+        "url": "https://github.com/sponsors/Brooooooklyn"
+      }
+    },
+    "node_modules/@napi-rs/canvas-linux-riscv64-gnu": {
+      "version": "1.1.0",
+      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-linux-riscv64-gnu/-/canvas-linux-riscv64-gnu-1.1.0.tgz",
+      "integrity": "sha512-kJ7m5n2VffxWXM5QGa5lfq8ZN4LdOJEoz3aAJAmIqYvKiZw1gRdXqpucnRXsF6D9nLYiiIlevaAtAclR7c5ilg==",
+      "cpu": [
+        "riscv64"
+      ],
+      "libc": [
+        "glibc"
+      ],
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">= 10"
+      },
+      "funding": {
+        "type": "github",
+        "url": "https://github.com/sponsors/Brooooooklyn"
+      }
+    },
+    "node_modules/@napi-rs/canvas-linux-x64-gnu": {
+      "version": "1.1.0",
+      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-linux-x64-gnu/-/canvas-linux-x64-gnu-1.1.0.tgz",
+      "integrity": "sha512-uQ9JuJlRhQdHyttcMWOiwLkfIqkqaB0YFUVe835LUe12THt2b51HXkTItq0fxWT1jdhUPX2ylWZ1walkJyD6GQ==",
+      "cpu": [
+        "x64"
+      ],
+      "libc": [
+        "glibc"
+      ],
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">= 10"
+      },
+      "funding": {
+        "type": "github",
+        "url": "https://github.com/sponsors/Brooooooklyn"
+      }
+    },
+    "node_modules/@napi-rs/canvas-linux-x64-musl": {
+      "version": "1.1.0",
+      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-linux-x64-musl/-/canvas-linux-x64-musl-1.1.0.tgz",
+      "integrity": "sha512-has4CPPAkkCac/LZ13VAw5p+MJLdaKVoyrhumN/A7uJd6960xYkJNDZgUebyxiha82AFzXx6RV+QJg5qGG079g==",
+      "cpu": [
+        "x64"
+      ],
+      "libc": [
+        "musl"
+      ],
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">= 10"
+      },
+      "funding": {
+        "type": "github",
+        "url": "https://github.com/sponsors/Brooooooklyn"
+      }
+    },
+    "node_modules/@napi-rs/canvas-win32-arm64-msvc": {
+      "version": "1.1.0",
+      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-win32-arm64-msvc/-/canvas-win32-arm64-msvc-1.1.0.tgz",
+      "integrity": "sha512-MJnktLKNijmXqdjTughHDZ9TDLZ9uUm2hvFXqaOqn0+w7lphXFnft6bpSgQAc9U1exc20UGIBlzGu9+kiCj9Ag==",
+      "cpu": [
+        "arm64"
+      ],
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "win32"
+      ],
+      "engines": {
+        "node": ">= 10"
+      },
+      "funding": {
+        "type": "github",
+        "url": "https://github.com/sponsors/Brooooooklyn"
+      }
+    },
+    "node_modules/@napi-rs/canvas-win32-x64-msvc": {
+      "version": "1.1.0",
+      "resolved": "https://registry.npmjs.org/@napi-rs/canvas-win32-x64-msvc/-/canvas-win32-x64-msvc-1.1.0.tgz",
+      "integrity": "sha512-08575bFk7iiadxap4h+JxgGut9xDCHAGum6wh0eInN53zEMImkmEHi5MushX2FOmNO7qRNX7BPiDC5ZYBwHeEg==",
+      "cpu": [
+        "x64"
+      ],
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "win32"
+      ],
+      "engines": {
+        "node": ">= 10"
+      },
+      "funding": {
+        "type": "github",
+        "url": "https://github.com/sponsors/Brooooooklyn"
+      }
+    },
+    "node_modules/@next/env": {
+      "version": "16.4.3",
+      "resolved": "https://registry.npmjs.org/@next/env/-/env-16.4.3.tgz",
+      "integrity": "sha512-a7tz1QCcWWkwC/rPJcPMJk/UNRu9CFhDd3OHYE5hddbJrs8BqRTalxI6GlKCWEGzRLHN+S/B7a4PAHCtm25aBQ==",
+      "license": "MIT"
+    },
+    "node_modules/@next/swc-darwin-arm64": {
+      "version": "16.4.3",
+      "resolved": "https://registry.npmjs.org/@next/swc-darwin-arm64/-/swc-darwin-arm64-16.4.3.tgz",
+      "integrity": "sha512-4yq5EXBt+VDtAZwTyfijaFp5D2C5oz3Ikw5a2kiX2K9nw72vrZX2q5UuAlkPtUMO1tQz6JTKpaKWjS7OOefTDQ==",
+      "cpu": [
+        "arm64"
+      ],
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "darwin"
+      ],
+      "engines": {
+        "node": ">= 10"
+      }
+    },
+    "node_modules/@next/swc-darwin-x64": {
+      "version": "16.4.3",
+      "resolved": "https://registry.npmjs.org/@next/swc-darwin-x64/-/swc-darwin-x64-16.4.3.tgz",
+      "integrity": "sha512-1Rvkn/LUhnEF8WxnRkOrqGhbwXui1bkWFxONKIbN+r7C+9KHDSZ+iUoj4CzymVMWUyZIyx9szcb9+kbKhD500A==",
+      "cpu": [
+        "x64"
+      ],
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "darwin"
+      ],
+      "engines": {
+        "node": ">= 10"
+      }
+    },
+    "node_modules/@next/swc-linux-arm64-gnu": {
+      "version": "16.4.3",
+      "resolved": "https://registry.npmjs.org/@next/swc-linux-arm64-gnu/-/swc-linux-arm64-gnu-16.4.3.tgz",
+      "integrity": "sha512-dCKpXErGg3abUM6t5JTJV/ottVBTStJB5lRJTbgdUdQaQ+jNHiK56Hsc0YAEg/rinSh42hYG3HWiYmEMdilnxg==",
+      "cpu": [
+        "arm64"
+      ],
+      "libc": [
+        "glibc"
+      ],
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">= 10"
+      }
+    },
+    "node_modules/@next/swc-linux-arm64-musl": {
+      "version": "16.4.3",
+      "resolved": "https://registry.npmjs.org/@next/swc-linux-arm64-musl/-/swc-linux-arm64-musl-16.4.3.tgz",
+      "integrity": "sha512-WwYbhWkhYBvBtib1K4W0kL8MW2snBD2A5b3SN4vPpqalZbZs5+bQ1yzAdepVoOqrFfEW3dmREy4Zs1MrWcrFbw==",
+      "cpu": [
+        "arm64"
+      ],
+      "libc": [
+        "musl"
+      ],
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">= 10"
+      }
+    },
+    "node_modules/@next/swc-linux-x64-gnu": {
+      "version": "16.4.3",
+      "resolved": "https://registry.npmjs.org/@next/swc-linux-x64-gnu/-/swc-linux-x64-gnu-16.4.3.tgz",
+      "integrity": "sha512-QymWvfUwDEC5/lpJOsxX5VAbyoR2D13+2Jsjz4be7gT4LPqEgdpkeLIR/HFfCLgKzoMhpJbp6I/JnogyNZHcaA==",
+      "cpu": [
+        "x64"
+      ],
+      "libc": [
+        "glibc"
+      ],
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">= 10"
+      }
+    },
+    "node_modules/@next/swc-linux-x64-musl": {
+      "version": "16.4.3",
+      "resolved": "https://registry.npmjs.org/@next/swc-linux-x64-musl/-/swc-linux-x64-musl-16.4.3.tgz",
+      "integrity": "sha512-Vmjd9D7DpA4Vv3cUlr82QWgJD/BQZmns801vtC5VWHg6jCIA4a5vMKpQnfrM2pyCrp2eV0ENdUg4PlN3bAc2Yw==",
+      "cpu": [
+        "x64"
+      ],
+      "libc": [
+        "musl"
+      ],
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "linux"
+      ],
+      "engines": {
+        "node": ">= 10"
+      }
+    },
+    "node_modules/@next/swc-win32-arm64-msvc": {
+      "version": "16.4.3",
+      "resolved": "https://registry.npmjs.org/@next/swc-win32-arm64-msvc/-/swc-win32-arm64-msvc-16.4.3.tgz",
+      "integrity": "sha512-lG1pPdPLk7gTyGb00n5JIMLdBJgjb+UEhSdZvFbhUMg0DyC6z4B7RnpSKF9VCd4imkLObVbXOFA0kFCpw7yFow==",
+      "cpu": [
+        "arm64"
+      ],
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "win32"
+      ],
+      "engines": {
+        "node": ">= 10"
+      }
+    },
+    "node_modules/@next/swc-win32-x64-msvc": {
+      "version": "16.4.3",
+      "resolved": "https://registry.npmjs.org/@next/swc-win32-x64-msvc/-/swc-win32-x64-msvc-16.4.3.tgz",
+      "integrity": "sha512-NmQC9RkJdnPXRaMxtkCzobB3teVjqF33oSOnwDfi+XYGWWYpt+xlGK3mtktSKLbdjwaWbJu2OkkMiRFGUUncKg==",
+      "cpu": [
+        "x64"
+      ],
+      "license": "MIT",
+      "optional": true,
+      "os": [
+        "win32"
+      ],
+      "engines": {
+        "node": ">= 10"
+      }
+    },
+    "node_modules/@pdf-lib/standard-fonts": {
+      "version": "1.0.0",
+      "resolved": "https://registry.npmjs.org/@pdf-lib/standard-fonts/-/standard-fonts-1.0.0.tgz",
+      "integrity": "sha512-hU30BK9IUN/su0Mn9VdlVKsWBS6GyhVfqjwl1FjZN4TxP6cCw0jP2w7V3Hf5uX7M0AZJ16vey9yE0ny7Sa59ZA==",
+      "license": "MIT",
+      "dependencies": {
+        "pako": "^1.0.6"
+      }
+    },
+    "node_modules/@pdf-lib/upng": {
+      "version": "1.0.1",
+      "resolved": "https://registry.npmjs.org/@pdf-lib/upng/-/upng-1.0.1.tgz",
+      "integrity": "sha512-dQK2FUMQtowVP00mtIksrlZhdFXQZPC+taih1q4CvPZ5vqdxR/LKBaFg0oAfzd1GlHZXXSPdQfzQnt+ViGvEIQ==",
+      "license": "MIT",
+      "dependencies": {
+        "pako": "^1.0.10"
+      }
+    },
+    "node_modules/@supabase/auth-js": {
+      "version": "2.118.0",
+      "resolved": "https://registry.npmjs.org/@supabase/auth-js/-/auth-js-2.118.0.tgz",
+      "integrity": "sha512-xWfPXyhS2KDSfAneMtI6p/tBnbdiz/5vaRKXEqUfzfC9WCniKr2Ds5o5G7RIGig0bom4z6wUY9zaV07WDVTfnQ==",
+      "license": "MIT",
+      "dependencies": {
+        "tslib": "2.8.1"
+      },
+      "engines": {
+        "node": ">=22.0.0"
+      }
+    },
+    "node_modules/@supabase/functions-js": {
+      "version": "2.118.0",
+      "resolved": "https://registry.npmjs.org/@supabase/functions-js/-/functions-js-2.118.0.tgz",
+      "integrity": "sha512-4ofletPa/noKAU6KHeqsd3FztGzRPUEJRey1MKY0o+PIHaVePqRPShIXtl37gcVyIWaFM+zNg6r9zh0uUSFOSA==",
+      "license": "MIT",
+      "dependencies": {
+        "tslib": "2.8.1"
+      },
+      "engines": {
+        "node": ">=22.0.0"
+      }
+    },
+    "node_modules/@supabase/phoenix": {
+      "version": "0.4.5",
+      "resolved": "https://registry.npmjs.org/@supabase/phoenix/-/phoenix-0.4.5.tgz",
+      "integrity": "sha512-aAn9H9ovVyeApKy11OWOrrOGq8DV68yWeH4ud2lN9fzn4aO8Zb5GLL9m1pUg9nLqIcT+ZDfAcsZe0E/nqdv2lw==",
+      "license": "MIT"
+    },
+    "node_modules/@supabase/postgrest-js": {
+      "version": "2.118.0",
+      "resolved": "https://registry.npmjs.org/@supabase/postgrest-js/-/postgrest-js-2.118.0.tgz",
+      "integrity": "sha512-JXy+37KPApHsyotaQACovv/Jy9E22rfiWLRuT+2UjoEAcAIelDFIrsF/FY47Dy19mO7lI0Tq+zDCX8oJ2Ozfiw==",
+      "license": "MIT",
+      "dependencies": {
+        "tslib": "2.8.1"
+      },
+      "engines": {
+        "node": ">=22.0.0"
+      }
+    },
+    "node_modules/@supabase/realtime-js": {
+      "version": "2.118.0",
+      "resolved": "https://registry.npmjs.org/@supabase/realtime-js/-/realtime-js-2.118.0.tgz",
+      "integrity": "sha512-pzCIEWjqD5/xqEZQerpt+q9rsgYkcrkgCJgf0W2ULqC4fYUeB/p9CFa3t9vn+IVh6dMN9r4ZCE262lZvUC+Bfw==",
+      "license": "MIT",
+      "dependencies": {
+        "@supabase/phoenix": "0.4.5",
+        "tslib": "2.8.1"
+      },
+      "engines": {
+        "node": ">=22.0.0"
+      }
+    },
+    "node_modules/@supabase/storage-js": {
+      "version": "2.118.0",
+      "resolved": "https://registry.npmjs.org/@supabase/storage-js/-/storage-js-2.118.0.tgz",
+      "integrity": "sha512-5MNkKt2Moy7Jud/sPX7/28BwdDxZMCVHGJT00b8op3KRa9LKSjOAYU5IcfGWIstaasAqY8GkbA6oI3IRDgB1YQ==",
+      "license": "MIT",
+      "dependencies": {
+        "iceberg-js": "^0.8.1",
+        "tslib": "2.8.1"
+      },
+      "engines": {
+        "node": ">=22.0.0"
+      }
+    },
+    "node_modules/@supabase/supabase-js": {
+      "version": "2.118.0",
+      "resolved": "https://registry.npmjs.org/@supabase/supabase-js/-/supabase-js-2.118.0.tgz",
+      "integrity": "sha512-FxI8UXMVC2UG7IkeiI8fuQZqq2oI3JeSuN8MPIC2RLVaoEAxKS0nqE6kii9Ewpq8f9gNPM6git1Y8f0vN/QLFw==",
+      "license": "MIT",
+      "dependencies": {
+        "@supabase/auth-js": "2.118.0",
+        "@supabase/functions-js": "2.118.0",
+        "@supabase/postgrest-js": "2.118.0",
+        "@supabase/realtime-js": "2.118.0",
+        "@supabase/storage-js": "2.118.0"
+      },
+      "engines": {
+        "node": ">=22.0.0"
+      },
+      "peerDependencies": {
+        "@opentelemetry/api": ">=1.0.0"
+      },
+      "peerDependenciesMeta": {
+        "@opentelemetry/api": {
+          "optional": true
+        }
+      }
+    },
+    "node_modules/@swc/helpers": {
+      "version": "0.5.23",
+      "resolved": "https://registry.npmjs.org/@swc/helpers/-/helpers-0.5.23.tgz",
+      "integrity": "sha512-5lSsMOTXURePglDfvuAQUqkGek9Hg2kksOYay2m0+XR++b2NWYL/4sWyuvVBIs8oKnJaxkdi9whaL/sqN13afw==",
+      "license": "Apache-2.0",
+      "dependencies": {
+        "tslib": "^2.8.0"
+      }
+    },
+    "node_modules/baseline-browser-mapping": {
+      "version": "2.11.34",
+      "resolved": "https://registry.npmjs.org/baseline-browser-mapping/-/baseline-browser-mapping-2.11.34.tgz",
+      "integrity": "sha512-Aqr8mA1kIvyJ3UY5YAY7ib8LSo1DmDMbMnVqGPtsKW1LxaFQFwn9Eb3yvq2fUKJsRvaXjnAV7R5osqETapzNiA==",
+      "license": "Apache-2.0",
+      "bin": {
+        "baseline-browser-mapping": "dist/cli.cjs"
+      },
+      "engines": {
+        "node": ">=6.0.0"
+      }
+    },
+    "node_modules/caniuse-lite": {
+      "version": "1.0.30001820",
+      "resolved": "https://registry.npmjs.org/caniuse-lite/-/caniuse-lite-1.0.30001820.tgz",
+      "integrity": "sha512-gfWD6MxqVCqAOwmODfZf7DchWvlrA+SRdNX7ceLfg3xRqe5ssjjpF7EgslC/0tiLiNTajdaNN/q8c/5u/7Gz8w==",
+      "funding": [
+        {
+          "type": "opencollective",
+          "url": "https://opencollective.com/browserslist"
+        },
+        {
+          "type": "tidelift",
+          "url": "https://tidelift.com/funding/github/npm/caniuse-lite"
+        },
+        {
+          "type": "github",
+          "url": "https://github.com/sponsors/ai"
+        }
+      ],
+      "license": "CC-BY-4.0"
+    },
+    "node_modules/client-only": {
+      "version": "0.0.1",
+      "resolved": "https://registry.npmjs.org/client-only/-/client-only-0.0.1.tgz",
+      "integrity": "sha512-IV3Ou0jSMzZrd3pZ48nLkT9DA7Ag1pnPzaiQhpW7c3RbcqqzvzzVu+L8gfqMp/8IM2MQtSiqaCxrrcfu8I8rMA==",
+      "license": "MIT"
+    },
+    "node_modules/detect-libc": {
+      "version": "2.1.2",
+      "resolved": "https://registry.npmjs.org/detect-libc/-/detect-libc-2.1.2.tgz",
+      "integrity": "sha512-Btj2BOOO83o3WyH59e8MgXsxEQVcarkUOpEYrubB0urwnN10yQ364rsiByU11nZlqWYZm05i/of7io4mzihBtQ==",
+      "license": "Apache-2.0",
+      "optional": true,
+      "engines": {
+        "node": ">=8"
+      }
+    },
+    "node_modules/iceberg-js": {
+      "version": "0.8.1",
+      "resolved": "https://registry.npmjs.org/iceberg-js/-/iceberg-js-0.8.1.tgz",
+      "integrity": "sha512-1dhVQZXhcHje7798IVM+xoo/1ZdVfzOMIc8/rgVSijRK38EDqOJoGula9N/8ZI5RD8QTxNQtK/Gozpr+qUqRRA==",
+      "license": "MIT",
+      "engines": {
+        "node": ">=20.0.0"
+      }
+    },
+    "node_modules/nanoid": {
+      "version": "3.3.20",
+      "resolved": "https://registry.npmjs.org/nanoid/-/nanoid-3.3.20.tgz",
+      "integrity": "sha512-uKdg2G3GNCKQn9byYOpxbGqrT2fGO5KRt5J/8b3pok8rT6qxGWF6hxMyJiEYtAf+FVyYuD9hRaDqX5uPFYJ4ZQ==",
+      "funding": [
+        {
+          "type": "github",
+          "url": "https://github.com/sponsors/ai"
+        }
+      ],
+      "license": "MIT",
+      "bin": {
+        "nanoid": "bin/nanoid.cjs"
+      },
+      "engines": {
+        "node": "^10 || ^12 || ^13.7 || ^14 || >=15.0.1"
+      }
+    },
+    "node_modules/next": {
+      "version": "16.4.3",
+      "resolved": "https://registry.npmjs.org/next/-/next-16.4.3.tgz",
+      "integrity": "sha512-OqxKTGi9u80FydydsMNYNjnuje9Au+kvHlt2GZ//ftdpDHm1dxKqAaENoOOTX5wKzn+9vaKUNIfZeyZUuLhCnA==",
+      "license": "MIT",
+      "dependencies": {
+        "@next/env": "16.4.3",
+        "@swc/helpers": "0.5.23",
+        "baseline-browser-mapping": "^2.9.19",
+        "caniuse-lite": "^1.0.30001579",
+        "postcss": "8.5.23",
+        "styled-jsx": "5.1.6"
+      },
+      "bin": {
+        "next": "dist/bin/next"
+      },
+      "engines": {
+        "node": ">=20.9.0"
+      },
+      "optionalDependencies": {
+        "@next/swc-darwin-arm64": "16.4.3",
+        "@next/swc-darwin-x64": "16.4.3",
+        "@next/swc-linux-arm64-gnu": "16.4.3",
+        "@next/swc-linux-arm64-musl": "16.4.3",
+        "@next/swc-linux-x64-gnu": "16.4.3",
+        "@next/swc-linux-x64-musl": "16.4.3",
+        "@next/swc-win32-arm64-msvc": "16.4.3",
+        "@next/swc-win32-x64-msvc": "16.4.3",
+        "sharp": "^0.35.5"
+      },
+      "peerDependencies": {
+        "@opentelemetry/api": "^1.1.0",
+        "@playwright/test": "^1.51.1",
+        "babel-plugin-react-compiler": "*",
+        "react": "^18.2.0 || 19.0.0-rc-de68d2f4-20241204 || ^19.0.0",
+        "react-dom": "^18.2.0 || 19.0.0-rc-de68d2f4-20241204 || ^19.0.0",
+        "sass": "^1.3.0"
+      },
+      "peerDependenciesMeta": {
+        "@opentelemetry/api": {
+          "optional": true
+        },
+        "@playwright/test": {
+          "optional": true
+        },
+        "babel-plugin-react-compiler": {
+          "optional": true
+        },
+        "sass": {
+          "optional": true
+        }
+      }
+    },
+    "node_modules/pako": {
+      "version": "1.0.11",
+      "resolved": "https://registry.npmjs.org/pako/-/pako-1.0.11.tgz",
+      "integrity": "sha512-4hLB8Py4zZce5s4yd9XzopqwVv/yGNhV1Bl8NTmCq1763HeK2+EwVTv+leGeL13Dnh2wfbqowVPXCIO0z4taYw==",
+      "license": "(MIT AND Zlib)"
+    },
+    "node_modules/pdf-lib": {
+      "version": "1.17.1",
+      "resolved": "https://registry.npmjs.org/pdf-lib/-/pdf-lib-1.17.1.tgz",
+      "integrity": "sha512-V/mpyJAoTsN4cnP31vc0wfNA1+p20evqqnap0KLoRUN0Yk/p3wN52DOEsL4oBFcLdb76hlpKPtzJIgo67j/XLw==",
+      "license": "MIT",
+      "dependencies": {
+        "@pdf-lib/standard-fonts": "^1.0.0",
+        "@pdf-lib/upng": "^1.0.1",
+        "pako": "^1.0.11",
+        "tslib": "^1.11.1"
+      }
+    },
+    "node_modules/pdf-lib/node_modules/tslib": {
+      "version": "1.14.1",
+      "resolved": "https://registry.npmjs.org/tslib/-/tslib-1.14.1.tgz",
+      "integrity": "sha512-Xni35NKzjgMrwevysHTCArtLDpPvye8zV/0E4EyYn43P7/7qvQwPh9BGkHewbMulVntbigmcT7rdX3BNo9wRJg==",
+      "license": "0BSD"
+    },
+    "node_modules/pdfjs-dist": {
+      "version": "6.4.299",
+      "resolved": "https://registry.npmjs.org/pdfjs-dist/-/pdfjs-dist-6.4.299.tgz",
+      "integrity": "sha512-AVl138zALtfaAPvADulE0PZThbYzCBS79nL4pOSL/6Sm/4AH5A21BD9VHt97OlCuzJuCpmeZtAtkinisF4Vb1g==",
+      "license": "Apache-2.0",
+      "engines": {
+        "node": ">=22.13.0 || >=24"
+      },
+      "optionalDependencies": {
+        "@napi-rs/canvas": "^1.0.10"
+      }
+    },
+    "node_modules/picocolors": {
+      "version": "1.1.1",
+      "resolved": "https://registry.npmjs.org/picocolors/-/picocolors-1.1.1.tgz",
+      "integrity": "sha512-xceH2snhtb5M9liqDsmEw56le376mTZkEX/jEb/RxNFyegNul7eNslCXP9FDj/Lcu0X8KEyMceP2ntpaHrDEVA==",
+      "license": "ISC"
+    },
+    "node_modules/postcss": {
+      "version": "8.5.23",
+      "resolved": "https://registry.npmjs.org/postcss/-/postcss-8.5.23.tgz",
+      "integrity": "sha512-g50586zr4bZmwFiTlflMu8E0bDTb5I5gertgwAKmsdUlTQIhZtunzUlD1WSzwcVWPoAVpsrA6vlfCD7oXvRwgg==",
+      "funding": [
+        {
+          "type": "opencollective",
+          "url": "https://opencollective.com/postcss/"
+        },
+        {
+          "type": "tidelift",
+          "url": "https://tidelift.com/funding/github/npm/postcss"
+        },
+        {
+          "type": "github",
+          "url": "https://github.com/sponsors/ai"
+        }
+      ],
+      "license": "MIT",
+      "dependencies": {
+        "nanoid": "^3.3.16",
+        "picocolors": "^1.1.1",
+        "source-map-js": "^1.2.1"
+      },
+      "engines": {
+        "node": "^10 || ^12 || >=14"
+      }
+    },
+    "node_modules/react": {
+      "version": "19.3.1",
+      "resolved": "https://registry.npmjs.org/react/-/react-19.3.1.tgz",
+      "integrity": "sha512-QNhWdt7nrgVWWQG58QuGsAR3jv3Hbe4mb4vz7w2csnHavciZJgda1CPNaldF6eVxv90ud3jUXpKlHL69gO38yw==",
+      "license": "MIT",
+      "engines": {
+        "node": ">=0.10.0"
+      }
+    },
+    "node_modules/react-dom": {
+      "version": "19.3.1",
+      "resolved": "https://registry.npmjs.org/react-dom/-/react-dom-19.3.1.tgz",
+      "integrity": "sha512-Y0bARz53lhEC1NMCASs0/j+faB/zqt3R8hpvg1e8+61ZVJ4UL0UdC4cBbXfZMcIuhrfgeILTLe+ZeBCavQPtKQ==",
+      "license": "MIT",
+      "dependencies": {
+        "scheduler": "^0.28.0"
+      },
+      "peerDependencies": {
+        "react": "^19.3.1"
+      }
+    },
+    "node_modules/scheduler": {
+      "version": "0.28.0",
+      "resolved": "https://registry.npmjs.org/scheduler/-/scheduler-0.28.0.tgz",
+      "integrity": "sha512-juorfCmIkIw8tT+p5BXSm6PJjQF/ycEYmKyzURCIt/RaZIhL+PulbQ9Yu2z1HdOJDdqDTlxA1+xKBmHXJsczAw==",
+      "license": "MIT"
+    },
+    "node_modules/semver": {
+      "version": "7.8.5",
+      "resolved": "https://registry.npmjs.org/semver/-/semver-7.8.5.tgz",
+      "integrity": "sha512-Y7/KDsb8LjooZpwaqGyulO6DQlksgCncchHGk+sZIY4SBvUocMBEFH5Ur1fI4dV+Jvl0w6cjvucaIi40puRioA==",
+      "license": "ISC",
+      "optional": true,
+      "bin": {
+        "semver": "bin/semver.js"
+      },
+      "engines": {
+        "node": ">=10"
+      }
+    },
+    "node_modules/sharp": {
+      "version": "0.35.5",
+      "resolved": "https://registry.npmjs.org/sharp/-/sharp-0.35.5.tgz",
+      "integrity": "sha512-Ywn4OnzGukp7CDMrp08RQ50YKmuwG47brZgIVPTvBaaAfQlRlygrRqSrxdCiL9M+LlzLBiJ68IR1QqvzHyjC7g==",
+      "license": "Apache-2.0",
+      "optional": true,
+      "dependencies": {
+        "@img/colour": "^1.1.0",
+        "detect-libc": "^2.1.2",
+        "semver": "^7.8.5"
+      },
+      "engines": {
+        "node": ">=20.9.0"
+      },
+      "funding": {
+        "url": "https://opencollective.com/libvips"
+      },
+      "optionalDependencies": {
+        "@img/sharp-darwin-arm64": "0.35.5",
+        "@img/sharp-darwin-x64": "0.35.5",
+        "@img/sharp-freebsd-wasm32": "0.35.5",
+        "@img/sharp-libvips-darwin-arm64": "1.3.4",
+        "@img/sharp-libvips-darwin-x64": "1.3.4",
+        "@img/sharp-libvips-linux-arm": "1.3.4",
+        "@img/sharp-libvips-linux-arm64": "1.3.4",
+        "@img/sharp-libvips-linux-ppc64": "1.3.4",
+        "@img/sharp-libvips-linux-riscv64": "1.3.4",
+        "@img/sharp-libvips-linux-s390x": "1.3.4",
+        "@img/sharp-libvips-linux-x64": "1.3.4",
+        "@img/sharp-libvips-linuxmusl-arm64": "1.3.4",
+        "@img/sharp-libvips-linuxmusl-x64": "1.3.4",
+        "@img/sharp-linux-arm": "0.35.5",
+        "@img/sharp-linux-arm64": "0.35.5",
+        "@img/sharp-linux-ppc64": "0.35.5",
+        "@img/sharp-linux-riscv64": "0.35.5",
+        "@img/sharp-linux-s390x": "0.35.5",
+        "@img/sharp-linux-x64": "0.35.5",
+        "@img/sharp-linuxmusl-arm64": "0.35.5",
+        "@img/sharp-linuxmusl-x64": "0.35.5",
+        "@img/sharp-webcontainers-wasm32": "0.35.5",
+        "@img/sharp-win32-arm64": "0.35.5",
+        "@img/sharp-win32-ia32": "0.35.5",
+        "@img/sharp-win32-x64": "0.35.5"
+      },
+      "peerDependenciesMeta": {
+        "@types/node": {
+          "optional": true
+        }
+      }
+    },
+    "node_modules/signature_pad": {
+      "version": "5.1.4",
+      "resolved": "https://registry.npmjs.org/signature_pad/-/signature_pad-5.1.4.tgz",
+      "integrity": "sha512-q0wO5a+U+AWPVcVmiNXz7FY4Ad1QiE8wto/3Yn41WVqepoVVYMvkb1CTokaWPUUAHWDLLabH3/acODeWM9jCrg==",
+      "license": "MIT"
+    },
+    "node_modules/source-map-js": {
+      "version": "1.2.2",
+      "resolved": "https://registry.npmjs.org/source-map-js/-/source-map-js-1.2.2.tgz",
+      "integrity": "sha512-KGj/8Y43x35aZVDtt+J4mK1hoLGHULMYfSkODJNQjNDC3oW1PqPoxMwo0pLUsWM/UEGzON/NxeHywEfNXNP3Vw==",
+      "license": "BSD-3-Clause",
+      "engines": {
+        "node": ">=0.10.0"
+      }
+    },
+    "node_modules/styled-jsx": {
+      "version": "5.1.6",
+      "resolved": "https://registry.npmjs.org/styled-jsx/-/styled-jsx-5.1.6.tgz",
+      "integrity": "sha512-qSVyDTeMotdvQYoHWLNGwRFJHC+i+ZvdBRYosOFgC+Wg1vx4frN2/RG/NA7SYqqvKNLf39P2LSRA2pu6n0XYZA==",
+      "license": "MIT",
+      "dependencies": {
+        "client-only": "0.0.1"
+      },
+      "engines": {
+        "node": ">= 12.0.0"
+      },
+      "peerDependencies": {
+        "react": ">= 16.8.0 || 17.x.x || ^18.0.0-0 || ^19.0.0-0"
+      },
+      "peerDependenciesMeta": {
+        "@babel/core": {
+          "optional": true
+        },
+        "babel-plugin-macros": {
+          "optional": true
+        }
+      }
+    },
+    "node_modules/tslib": {
+      "version": "2.8.1",
+      "resolved": "https://registry.npmjs.org/tslib/-/tslib-2.8.1.tgz",
+      "integrity": "sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w==",
+      "license": "0BSD"
+    }
+  }
+}
+
+
+============================================================
+FILE: package.json
+============================================================
+
+{"name":"document-workflow-enterprise","version":"2.0.0","private":true,"scripts":{"dev":"next dev","build":"next build","start":"next start"},"dependencies":{"@supabase/supabase-js":"^2.79.0","next":"^16.0.0","pdf-lib":"^1.17.1","pdfjs-dist":"^6.3.289","react":"^19.0.0","react-dom":"^19.0.0","signature_pad":"^5.1.2"}}
+
+
+============================================================
+FILE: supabase/schema.sql
+============================================================
+
+-- Run once on a NEW Supabase project.
+create extension if not exists pgcrypto;
+create table public.positions(id uuid primary key default gen_random_uuid(),name text unique not null,description text,is_active boolean default true,sort_order int default 0,created_at timestamptz default now());
+insert into public.positions(name,sort_order) values ('เธเธฃเธน',1),('เธเธธเธเธฅเธฒเธเธฃ',2),('เธซเธฑเธงเธซเธเนเธฒเธเนเธฒเธขเธเธฒเธ',3),('เธฃเธญเธเธเธนเนเธญเธณเธเธงเธขเธเธฒเธฃเธชเธ–เธฒเธเธจเธถเธเธฉเธฒ',4),('เธเธนเนเธญเธณเธเธงเธขเธเธฒเธฃเธชเธ–เธฒเธเธจเธถเธเธฉเธฒ',5);
+create table public.profiles(id uuid primary key references auth.users(id) on delete cascade,full_name text not null default '',system_role text not null default 'user' check(system_role in('user','admin','super_admin')),position_id uuid references positions(id) on delete set null,department text,is_active boolean default true,can_review boolean default false,can_approve boolean default false,created_at timestamptz default now(),updated_at timestamptz default now());
+create table public.documents(id uuid primary key default gen_random_uuid(),title text not null,description text,file_path text unique not null,file_name text not null,file_size bigint not null,owner_id uuid references profiles(id),status text not null default 'draft' check(status in('draft','submitted','in_review','changes_requested','approved','archived','cancelled')),revision int default 1,created_at timestamptz default now(),updated_at timestamptz default now());
+create table public.workflow_templates(id uuid primary key default gen_random_uuid(),name text not null,description text,is_active boolean default true,created_by uuid references profiles(id),created_at timestamptz default now());
+create table public.workflow_template_steps(id uuid primary key default gen_random_uuid(),template_id uuid references workflow_templates(id) on delete cascade,step_order int not null,name text not null,assignee_type text default 'position',position_id uuid references positions(id),approval_mode text default 'any',requires_signature boolean default false);
+create table public.document_workflows(id uuid primary key default gen_random_uuid(),document_id uuid unique references documents(id) on delete cascade,template_id uuid references workflow_templates(id),current_step int default 1,status text default 'active',created_at timestamptz default now());
+create table public.document_workflow_steps(id uuid primary key default gen_random_uuid(),workflow_id uuid references document_workflows(id) on delete cascade,step_order int not null,name text not null,approval_mode text default 'any',requires_signature boolean default false,status text default 'waiting' check(status in('waiting','active','approved','rejected','skipped')),decided_at timestamptz);
+create table public.workflow_step_assignees(id uuid primary key default gen_random_uuid(),step_id uuid references document_workflow_steps(id) on delete cascade,user_id uuid references profiles(id),status text default 'pending',acted_at timestamptz,unique(step_id,user_id));
+create table public.workflow_actions(id uuid primary key default gen_random_uuid(),document_id uuid references documents(id),step_id uuid references document_workflow_steps(id),actor_id uuid references profiles(id),action text not null,comment text,created_at timestamptz default now());
+create table public.signatures(id uuid primary key default gen_random_uuid(),document_id uuid references documents(id) on delete cascade,user_id uuid references profiles(id),page_number int not null,x_ratio numeric not null,y_ratio numeric not null,width_ratio numeric not null,height_ratio numeric not null,image_path text,signed_at timestamptz default now());
+create table public.document_archives(id uuid primary key default gen_random_uuid(),document_id uuid references documents(id),drive_id text,item_id text,web_url text,file_name text,file_size bigint,sha256 text,archived_by uuid references profiles(id),archived_at timestamptz default now());
+create table public.audit_logs(id bigint generated always as identity primary key,actor_id uuid references profiles(id),action text not null,entity_type text,entity_id uuid,details jsonb,created_at timestamptz default now());
+create or replace function public.new_profile() returns trigger language plpgsql security definer set search_path=public as $$begin insert into profiles(id,full_name) values(new.id,coalesce(new.raw_user_meta_data->>'full_name',split_part(new.email,'@',1)));return new;end$$;
+create trigger auth_profile after insert on auth.users for each row execute procedure public.new_profile();
+create or replace function public.is_admin() returns boolean language sql stable security definer set search_path=public as $$select exists(select 1 from profiles where id=auth.uid() and system_role in('admin','super_admin') and is_active)$$;
+create or replace function public.instantiate_workflow(p_document_id uuid,p_template_id uuid) returns uuid language plpgsql security definer set search_path=public as $$declare w uuid;s record;st uuid;begin if not exists(select 1 from documents where id=p_document_id and owner_id=auth.uid()) then raise exception 'เนเธกเนเธกเธตเธชเธดเธ—เธเธดเน';end if;insert into document_workflows(document_id,template_id) values(p_document_id,p_template_id) returning id into w;for s in select * from workflow_template_steps where template_id=p_template_id order by step_order loop insert into document_workflow_steps(workflow_id,step_order,name,approval_mode,requires_signature,status) values(w,s.step_order,s.name,s.approval_mode,s.requires_signature,case when s.step_order=1 then 'active' else 'waiting' end) returning id into st;insert into workflow_step_assignees(step_id,user_id) select st,id from profiles where position_id=s.position_id and is_active and (can_review or can_approve);end loop;update documents set status='in_review' where id=p_document_id;return w;end$$;
+create or replace function public.act_on_workflow(p_document_id uuid,p_action text,p_comment text default '') returns void language plpgsql security definer set search_path=public as $$declare st document_workflow_steps%rowtype;wf document_workflows%rowtype;begin select s.* into st from document_workflow_steps s join document_workflows w on w.id=s.workflow_id join workflow_step_assignees a on a.step_id=s.id where w.document_id=p_document_id and s.status='active' and a.user_id=auth.uid() limit 1;if st.id is null then raise exception 'เนเธกเนเนเธ”เนเธฃเธฑเธเธกเธญเธเธซเธกเธฒเธขเนเธเธเธฑเนเธเธ•เธญเธเธเธฑเธเธเธธเธเธฑเธ';end if;select * into wf from document_workflows where id=st.workflow_id;if p_action='rejected' then update document_workflow_steps set status='rejected',decided_at=now() where id=st.id;update documents set status='changes_requested' where id=p_document_id;else update workflow_step_assignees set status='approved',acted_at=now() where step_id=st.id and user_id=auth.uid();update document_workflow_steps set status='approved',decided_at=now() where id=st.id;update document_workflow_steps set status='active' where workflow_id=wf.id and step_order=st.step_order+1;if not found then update documents set status='approved' where id=p_document_id;update document_workflows set status='completed' where id=wf.id;else update document_workflows set current_step=st.step_order+1 where id=wf.id;end if;end if;insert into workflow_actions(document_id,step_id,actor_id,action,comment) values(p_document_id,st.id,auth.uid(),p_action,p_comment);end$$;
+alter table positions enable row level security;alter table profiles enable row level security;alter table documents enable row level security;alter table workflow_templates enable row level security;alter table workflow_template_steps enable row level security;alter table document_workflows enable row level security;alter table document_workflow_steps enable row level security;alter table workflow_step_assignees enable row level security;alter table workflow_actions enable row level security;alter table signatures enable row level security;alter table document_archives enable row level security;alter table audit_logs enable row level security;
+create policy positions_read on positions for select to authenticated using(true);create policy positions_admin on positions for all to authenticated using(is_admin()) with check(is_admin());
+create policy profiles_read on profiles for select to authenticated using(true);
+create policy docs_read on documents for select to authenticated using(owner_id=auth.uid() or is_admin() or exists(select 1 from document_workflows w join document_workflow_steps s on s.workflow_id=w.id join workflow_step_assignees a on a.step_id=s.id where w.document_id=documents.id and a.user_id=auth.uid()));create policy docs_insert on documents for insert to authenticated with check(owner_id=auth.uid());create policy docs_update on documents for update to authenticated using(owner_id=auth.uid() or is_admin());
+create policy templates_read on workflow_templates for select to authenticated using(true);create policy templates_admin on workflow_templates for all to authenticated using(is_admin()) with check(is_admin());create policy template_steps_read on workflow_template_steps for select to authenticated using(true);create policy template_steps_admin on workflow_template_steps for all to authenticated using(is_admin()) with check(is_admin());
+create policy wf_read on document_workflows for select to authenticated using(true);create policy wf_insert on document_workflows for insert to authenticated with check(true);create policy steps_read on document_workflow_steps for select to authenticated using(true);create policy assignees_read on workflow_step_assignees for select to authenticated using(true);create policy actions_read on workflow_actions for select to authenticated using(true);create policy sig_rw on signatures for all to authenticated using(user_id=auth.uid() or is_admin()) with check(user_id=auth.uid());create policy archives_read on document_archives for select to authenticated using(true);create policy audit_admin on audit_logs for select to authenticated using(is_admin());
+grant execute on function instantiate_workflow(uuid,uuid) to authenticated;grant execute on function act_on_workflow(uuid,text,text) to authenticated;
+insert into storage.buckets(id,name,public,file_size_limit,allowed_mime_types) values('documents','documents',false,52428800,array['application/pdf']),('signatures','signatures',false,3145728,array['image/png']) on conflict(id) do nothing;
+create policy document_upload on storage.objects for insert to authenticated with check(bucket_id='documents' and (storage.foldername(name))[1]=auth.uid()::text);create policy document_read on storage.objects for select to authenticated using(bucket_id='documents' and exists(select 1 from documents d where d.file_path=name and (d.owner_id=auth.uid() or is_admin() or exists(select 1 from document_workflows w join document_workflow_steps s on s.workflow_id=w.id join workflow_step_assignees a on a.step_id=s.id where w.document_id=d.id and a.user_id=auth.uid()))));
+

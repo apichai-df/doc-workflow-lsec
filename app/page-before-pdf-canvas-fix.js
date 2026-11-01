@@ -1,0 +1,775 @@
+'use client'
+import { useEffect, useRef, useState } from 'react'
+import { supabase } from '../lib/supabase-browser'
+import { PDFDocument } from 'pdf-lib'
+import SignaturePad from 'signature_pad'
+import PdfCanvasViewer from './components/PdfCanvasViewer'
+
+const STATUS = {
+  owner_review: 'รอเจ้าของตรวจและลงนาม',
+  in_review: 'กำลังตรวจสอบ',
+  changes_requested: 'ส่งกลับแก้ไข',
+  approved: 'อนุมัติครบ',
+  archive_pending: 'รอจัดเก็บ',
+  archived: 'จัดเก็บแล้ว',
+  draft: 'ฉบับร่าง'
+}
+const stepLabel = s =>
+  s === 'approved'
+    ? 'ดำเนินการแล้ว'
+    : s === 'active'
+    ? 'กำลังดำเนินการ'
+    : s === 'rejected'
+    ? 'ส่งกลับแก้ไข'
+    : 'ยังไม่ถึงขั้นตอน'
+
+export default function App () {
+  const [session, setSession] = useState(null)
+  const [data, setData] = useState(null)
+  const [tab, setTab] = useState('owned')
+  const [docId, setDocId] = useState(null)
+  const [toast, setToast] = useState(null)
+  const [showNew, setShowNew] = useState(false)
+  const [flows, setFlows] = useState([])
+
+  useEffect(() => {
+    supabase.auth.getSession().then(result => setSession(result.data.session))
+    const { data: listener } = supabase.auth.onAuthStateChange(
+      (_, nextSession) => {
+        setSession(nextSession)
+      }
+    )
+    return () => listener.subscription.unsubscribe()
+  }, [])
+
+  useEffect(() => {
+    if (!session) {
+      setData(null)
+      return
+    }
+    loadDashboard()
+    supabase
+      .from('workflow_templates')
+      .select('id,name')
+      .eq('is_active', true)
+      .then(result => setFlows(result.data || []))
+  }, [session])
+
+  function flash (text, type = 'ok') {
+    setToast({ text, type })
+    setTimeout(() => setToast(null), 3500)
+  }
+
+  function authHeaders () {
+    return { Authorization: `Bearer ${session.access_token}` }
+  }
+
+  async function loadDashboard () {
+    const response = await fetch('/api/dashboard', { headers: authHeaders() })
+    const result = await response.json()
+    if (!response.ok) {
+      flash(result.error, 'error')
+      return
+    }
+    setData(result)
+  }
+
+  if (!session) return <Login flash={flash} />
+  if (!data) return <div className='center'>กำลังเตรียมพื้นที่ทำงาน...</div>
+
+  if (docId) {
+    return (
+      <Workspace
+        id={docId}
+        session={session}
+        flash={flash}
+        back={() => {
+          setDocId(null)
+          loadDashboard()
+        }}
+      />
+    )
+  }
+
+  const rows =
+    tab === 'owned'
+      ? data.owned
+      : tab === 'inbox'
+      ? data.inbox.map(item => item.step.workflow.document)
+      : data.history.map(item => item.step.workflow.document)
+
+  const title =
+    tab === 'owned'
+      ? 'เอกสารที่ฉันสร้าง'
+      : tab === 'inbox'
+      ? 'งานที่ถึงคิวของฉัน'
+      : 'งานที่ดำเนินการแล้ว'
+
+  return (
+    <>
+      <Header profile={data.profile} />
+      {toast && (
+        <div className={`toast ${toast.type === 'error' ? 'error' : ''}`}>
+          {toast.text}
+        </div>
+      )}
+
+      <main>
+        <div className='hero'>
+          <div>
+            <span className='eyebrow'>DOCUMENT WORKFLOW</span>
+            <h1>ศูนย์งานเอกสาร</h1>
+            <p>ติดตาม ตรวจสอบ ลงนาม และจัดเก็บเอกสารในพื้นที่เดียว</p>
+          </div>
+          <button className='primary' onClick={() => setShowNew(true)}>
+            ＋ สร้างเอกสาร
+          </button>
+        </div>
+
+        <div className='metricGrid'>
+          <Metric value={data.owned.length} label='เอกสารของฉัน' />
+          <Metric value={data.inbox.length} label='งานที่รอดำเนินการ' accent />
+          <Metric
+            value={
+              data.owned.filter(item => item.status === 'changes_requested')
+                .length
+            }
+            label='ส่งกลับแก้ไข'
+          />
+          <Metric
+            value={data.owned.filter(item => item.status === 'archived').length}
+            label='จัดเก็บแล้ว'
+          />
+        </div>
+
+        <div className='tabs'>
+          <button
+            className={tab === 'owned' ? 'active' : ''}
+            onClick={() => setTab('owned')}
+          >
+            เอกสารของฉัน
+          </button>
+          <button
+            className={tab === 'inbox' ? 'active' : ''}
+            onClick={() => setTab('inbox')}
+          >
+            งานที่รอตรวจ <b>{data.inbox.length}</b>
+          </button>
+          <button
+            className={tab === 'history' ? 'active' : ''}
+            onClick={() => setTab('history')}
+          >
+            ประวัติการตรวจ
+          </button>
+        </div>
+
+        <section className='card docsTable'>
+          <div className='tableHead'>
+            <h2>{title}</h2>
+            <span className='muted'>{rows.length} รายการ</span>
+          </div>
+
+          {rows.length > 0 ? (
+            rows.map(document => (
+              <button
+                className='docRow'
+                key={document.id}
+                onClick={() => setDocId(document.id)}
+              >
+                <span className='fileIcon'>PDF</span>
+                <span>
+                  <b>{document.title}</b>
+                  <small>
+                    {document.owner?.full_name || 'เจ้าของเอกสาร'} • แก้ไข{' '}
+                    {new Date(document.updated_at).toLocaleString('th-TH')}
+                  </small>
+                </span>
+                <Status value={document.status} />
+                <Progress doc={document} />
+                <strong>›</strong>
+              </button>
+            ))
+          ) : (
+            <div className='empty'>ไม่มีรายการในมุมมองนี้</div>
+          )}
+        </section>
+
+        {showNew && (
+          <NewDocument
+            flows={flows}
+            session={session}
+            close={() => setShowNew(false)}
+            done={() => {
+              setShowNew(false)
+              loadDashboard()
+              flash('สร้างเอกสารและเริ่ม Workflow แล้ว')
+            }}
+          />
+        )}
+      </main>
+    </>
+  )
+}
+
+function Login ({ flash }) {
+  async function submit (e) {
+    e.preventDefault()
+    const f = new FormData(e.currentTarget),
+      { error } = await supabase.auth.signInWithPassword({
+        email: String(f.get('email')).trim(),
+        password: String(f.get('password'))
+      })
+    if (error) flash(error.message, 'error')
+  }
+  return (
+    <div className='loginPage'>
+      <section>
+        <div className='logo'>ศศ</div>
+        <span className='eyebrow'>LSEC DOCUMENT FLOW</span>
+        <h1>
+          เอกสารเดินหน้า
+          <br />
+          <em>ทุกลายเซ็นตรวจสอบได้</em>
+        </h1>
+        <p>
+          ระบบอนุมัติเอกสารแบบ Revision ที่ส่งต่อ PDF ฉบับล่าสุดในทุกขั้นตอน
+        </p>
+      </section>
+      <form className='card loginCard' method='post' onSubmit={submit}>
+        <h2>เข้าสู่ระบบ</h2>
+        <label>
+          อีเมล
+          <input name='email' type='email' autoComplete='username' required />
+        </label>
+        <label>
+          รหัสผ่าน
+          <input
+            name='password'
+            type='password'
+            autoComplete='current-password'
+            required
+          />
+        </label>
+        <button className='primary full'>เข้าสู่ระบบ</button>
+      </form>
+    </div>
+  )
+}
+function Header ({ profile }) {
+  return (
+    <header>
+      <div className='brand'>
+        <i>ศศ</i>
+        <div>
+          <b>ระบบเอกสารอิเล็กทรอนิกส์</b>
+          <small>{profile.full_name}</small>
+        </div>
+      </div>
+      <nav>
+        <button onClick={() => location.reload()}>เอกสาร</button>
+        <button onClick={() => supabase.auth.signOut()}>ออกจากระบบ</button>
+      </nav>
+    </header>
+  )
+}
+function Metric ({ value, label, accent }) {
+  return (
+    <div className={'metric ' + (accent ? 'accent' : '')}>
+      <b>{value}</b>
+      <span>{label}</span>
+    </div>
+  )
+}
+function Status ({ value }) {
+  return <em className={'status ' + value}>{STATUS[value] || value}</em>
+}
+function Progress ({ doc }) {
+  const wf = Array.isArray(doc.workflow) ? doc.workflow[0] : doc.workflow,
+    steps = wf?.steps || [],
+    done = steps.filter(x => x.status === 'approved').length
+  return (
+    <span className='miniProgress'>
+      <i
+        style={{ width: `${steps.length ? (done / steps.length) * 100 : 0}%` }}
+      />
+      <small>
+        {done}/{steps.length} ขั้น
+      </small>
+    </span>
+  )
+}
+
+function NewDocument ({ flows, session, close, done }) {
+  const [busy, setBusy] = useState(false),
+    [error, setError] = useState('')
+  async function submit (e) {
+    e.preventDefault()
+    setBusy(true)
+    setError('')
+    const form = new FormData(e.currentTarget),
+      r = await fetch('/api/documents', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${session.access_token}` },
+        body: form
+      }),
+      j = await r.json()
+    setBusy(false)
+    if (!r.ok) return setError(j.error)
+    done()
+  }
+  return (
+    <Modal close={close}>
+      <form onSubmit={submit}>
+        <span className='eyebrow'>NEW DOCUMENT</span>
+        <h2>สร้างเอกสารและเริ่ม Workflow</h2>
+        {error && <div className='alert error'>{error}</div>}
+        <label>
+          ชื่อเอกสาร
+          <input name='title' required />
+        </label>
+        <label>
+          รายละเอียด
+          <textarea name='description' rows='3' />
+        </label>
+        <label>
+          Workflow
+          <select name='template_id' required>
+            <option value=''>เลือก Workflow</option>
+            {flows.map(x => (
+              <option key={x.id} value={x.id}>
+                {x.name}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          ไฟล์ PDF
+          <input name='file' type='file' accept='application/pdf' required />
+        </label>
+        <div className='alert'>
+          เจ้าของเอกสารจะเป็นผู้ตรวจและลงนามขั้นแรกโดยอัตโนมัติ
+        </div>
+        <button className='primary full' disabled={busy}>
+          {busy ? 'กำลังสร้าง...' : 'สร้างเอกสาร'}
+        </button>
+      </form>
+    </Modal>
+  )
+}
+
+function Workspace ({ id, session, back, flash }) {
+  const [ws, setWs] = useState(null),
+    [page, setPage] = useState(1),
+    [pageCount, setPageCount] = useState(1),
+    [layers, setLayers] = useState([]),
+    [comment, setComment] = useState(''),
+    [sign, setSign] = useState(false),
+    [busy, setBusy] = useState(false),
+    drag = useRef(null)
+  useEffect(() => {
+    load()
+  }, [id])
+  async function load () {
+    const r = await fetch(`/api/documents/${id}/workspace`, {
+        headers: { Authorization: `Bearer ${session.access_token}` }
+      }),
+      j = await r.json()
+    if (!r.ok) return flash(j.error, 'error')
+    setWs(j)
+    const b = await fetch(j.revisionUrl).then(x => x.arrayBuffer())
+    setPageCount((await PDFDocument.load(b)).getPageCount())
+  }
+  if (!ws) return <div className='center'>กำลังโหลด PDF Revision ล่าสุด...</div>
+  const active = ws.active
+  function addLayer (image) {
+    const id = crypto.randomUUID()
+
+    setLayers(previousLayers => [
+      ...previousLayers,
+      {
+        id,
+        image_data: image,
+        page_number: page,
+
+        x_ratio: 0.38,
+        y_ratio: 0.42,
+
+        width_ratio: 0.24,
+        height_ratio: 0.1,
+
+        opacity: 1
+      }
+    ])
+
+    setSelectedLayerId(id)
+    setSign(false)
+  }
+  const [selectedLayerId, setSelectedLayerId] = useState(null)
+  function moveStart (e, l) {
+    drag.current = {
+      id: l.id,
+      x: e.clientX,
+      y: e.clientY,
+      ox: l.x_ratio,
+      oy: l.y_ratio
+    }
+    e.currentTarget.setPointerCapture(e.pointerId)
+  }
+  function move (e) {
+    if (!drag.current) return
+    const box = e.currentTarget.parentElement.getBoundingClientRect()
+    setLayers(xs =>
+      xs.map(x =>
+        x.id === drag.current.id
+          ? {
+              ...x,
+              x_ratio: Math.max(
+                0,
+                Math.min(
+                  0.8,
+                  drag.current.ox + (e.clientX - drag.current.x) / box.width
+                )
+              ),
+              y_ratio: Math.max(
+                0,
+                Math.min(
+                  0.9,
+                  drag.current.oy + (e.clientY - drag.current.y) / box.height
+                )
+              )
+            }
+          : x
+      )
+    )
+  }
+  function updateLayer (layerId, patch) {
+    setLayers(previousLayers =>
+      previousLayers.map(layer =>
+        layer.id === layerId
+          ? {
+              ...layer,
+              ...patch
+            }
+          : layer
+      )
+    )
+  }
+  async function forward () {
+    setBusy(true)
+    const r = await fetch(`/api/documents/${id}/sign-and-forward`, {
+        method: 'POST',
+        headers: {
+          ...{ 'Content-Type': 'application/json' },
+          Authorization: `Bearer ${session.access_token}`
+        },
+        body: JSON.stringify({ layers, comment })
+      }),
+      j = await r.json()
+    setBusy(false)
+    if (!r.ok) return flash(j.error, 'error')
+    flash(
+      j.completed
+        ? 'Workflow เสร็จและจัดเก็บ SharePoint แล้ว'
+        : 'สร้าง PDF Revision ใหม่และส่งต่อแล้ว'
+    )
+    back()
+  }
+  async function archiveFinal () {
+    setBusy(true)
+    const r = await fetch(`/api/documents/${id}/archive-final`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${session.access_token}` }
+      }),
+      j = await r.json()
+    setBusy(false)
+    if (!r.ok) return flash(j.error, 'error')
+    flash('จัดเก็บ SharePoint แล้ว')
+    if (j.webUrl) window.open(j.webUrl, '_blank')
+    back()
+  }
+  async function reject () {
+    if (comment.trim().length < 3) return flash('กรุณาระบุเหตุผล', 'error')
+    setBusy(true)
+    const r = await fetch(`/api/documents/${id}/return-to-owner`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session.access_token}`
+        },
+        body: JSON.stringify({ comment })
+      }),
+      j = await r.json()
+    setBusy(false)
+    if (!r.ok) return flash(j.error, 'error')
+    flash('ส่งกลับเจ้าของเอกสารแล้ว')
+    back()
+  }
+  return (
+    <main className='workspacePage'>
+      <div className='workspaceTop'>
+        <button className='ghost' onClick={back}>
+          ‹ กลับรายการ
+        </button>
+        <div>
+          <b>{ws.document.title}</b>
+          <small>
+            Revision {ws.document.revision?.revision_number || 0} •{' '}
+            {STATUS[ws.document.status]}
+          </small>
+        </div>
+        {ws.canAct && <span className='liveDot'>ถึงคิวของคุณ</span>}
+      </div>
+      <div className='workspaceGrid'>
+        <section className='viewerCard'>
+          <div className='pageBar'>
+            <button disabled={page <= 1} onClick={() => setPage(p => p - 1)}>
+              ‹
+            </button>
+            <span>
+              หน้า{' '}
+              <input
+                type='number'
+                min='1'
+                max={pageCount}
+                value={page}
+                onChange={e =>
+                  setPage(
+                    Math.max(1, Math.min(pageCount, +e.target.value || 1))
+                  )
+                }
+              />{' '}
+              จาก {pageCount}
+            </span>
+            <button
+              disabled={page >= pageCount}
+              onClick={() => setPage(p => p + 1)}
+            >
+              ›
+            </button>
+          </div>
+          <PdfCanvasViewer
+            url={ws.revisionUrl}
+            pageNumber={page}
+            onPageCount={nextPageCount => {
+              setPageCount(nextPageCount)
+
+              setPage(previousPage =>
+                Math.max(1, Math.min(nextPageCount, previousPage))
+              )
+            }}
+            layers={layers}
+            onLayerChange={updateLayer}
+            selectedLayerId={selectedLayerId}
+            onSelectLayer={setSelectedLayerId}
+          />
+        </section>
+        <aside>
+          <section className='card'>
+            <span className='eyebrow'>CURRENT STEP</span>
+            <h2>{active?.name || 'Workflow เสร็จสิ้น'}</h2>
+            <p>{active?.assignees?.map(x => x.user?.full_name).join(', ')}</p>
+            {active?.requires_signature && (
+              <span className='requirement'>ต้องลงลายเซ็น</span>
+            )}
+            {active?.requires_comment && (
+              <span className='requirement'>ต้องแสดงความคิดเห็น</span>
+            )}
+          </section>
+          <section className='card'>
+            <h3>ความคืบหน้า</h3>
+            <div className='flow'>
+              {ws.steps.map(s => (
+                <article className={s.status} key={s.id}>
+                  <i>
+                    {s.status === 'approved'
+                      ? '✓'
+                      : s.status === 'active'
+                      ? '●'
+                      : '○'}
+                  </i>
+                  <div>
+                    <b>
+                      {s.step_order}. {s.name}
+                    </b>
+                    <small>
+                      {stepLabel(s.status)} •{' '}
+                      {s.assignees?.map(a => a.user?.full_name).join(', ')}
+                    </small>
+                  </div>
+                </article>
+              ))}
+            </div>
+          </section>
+          {ws.canAct && (
+            <>
+              <section className='card'>
+                <div className='tableHead'>
+                  <h3>ลายเซ็นของขั้นนี้</h3>
+                  <button className='primary' onClick={() => setSign(true)}>
+                    ＋ เพิ่ม
+                  </button>
+                </div>
+                {layers.map(l => (
+                  <div className='draftLayer' key={l.id}>
+                    <span>
+                      <b>ลายเซ็น</b>
+                      <small>หน้า {l.page_number}</small>
+                    </span>
+                    <select
+                      value={l.page_number}
+                      onChange={e => {
+                        const n = +e.target.value
+                        setLayers(xs =>
+                          xs.map(x =>
+                            x.id === l.id ? { ...x, page_number: n } : x
+                          )
+                        )
+                        setPage(n)
+                      }}
+                    >
+                      {Array.from({ length: pageCount }, (_, i) => (
+                        <option key={i + 1} value={i + 1}>
+                          หน้า {i + 1}
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      className='danger'
+                      onClick={() =>
+                        setLayers(x => x.filter(a => a.id !== l.id))
+                      }
+                    >
+                      ลบ
+                    </button>
+                  </div>
+                ))}
+              </section>
+              <section className='card'>
+                <h3>ความคิดเห็น</h3>
+                <textarea
+                  rows='4'
+                  value={comment}
+                  onChange={e => setComment(e.target.value)}
+                  placeholder='บันทึกข้อสังเกต หรือเหตุผลที่ส่งกลับ'
+                />
+              </section>
+              <div className='actionDock'>
+                <button className='danger' disabled={busy} onClick={reject}>
+                  ส่งกลับเจ้าของ
+                </button>
+                <button className='approve' disabled={busy} onClick={forward}>
+                  {busy
+                    ? 'กำลังสร้าง Revision...'
+                    : 'ลงนาม สร้าง Revision และส่งต่อ'}
+                </button>
+              </div>
+            </>
+          )}
+          {ws.isOwner &&
+            ['approved', 'archive_pending'].includes(ws.document.status) && (
+              <section className='card'>
+                <h3>จัดเก็บฉบับสุดท้าย</h3>
+                <p className='muted'>
+                  Workflow เสร็จแล้ว แต่ยังไม่ได้จัดเก็บใน SharePoint
+                </p>
+                <button
+                  className='approve full'
+                  disabled={busy}
+                  onClick={archiveFinal}
+                >
+                  ลองจัดเก็บ SharePoint อีกครั้ง
+                </button>
+              </section>
+            )}
+          <section className='card'>
+            <h3>ประวัติเอกสาร</h3>
+            <div className='timeline'>
+              {ws.actions.map(a => (
+                <article key={a.id}>
+                  <b>
+                    {a.action === 'approved'
+                      ? 'อนุมัติและส่งต่อ'
+                      : 'ส่งกลับแก้ไข'}
+                  </b>
+                  <p>{a.comment || 'ไม่มีความคิดเห็น'}</p>
+                  <small>
+                    {a.actor?.full_name} •{' '}
+                    {new Date(a.created_at).toLocaleString('th-TH')}
+                  </small>
+                </article>
+              ))}
+            </div>
+          </section>
+        </aside>
+      </div>
+      {sign && (
+        <Modal close={() => setSign(false)}>
+          <Signature onData={addLayer} />
+        </Modal>
+      )}
+    </main>
+  )
+}
+
+function Signature ({ onData }) {
+  const canvas = useRef(),
+    pad = useRef()
+  useEffect(() => {
+    const c = canvas.current,
+      r = devicePixelRatio || 1
+    c.width = c.offsetWidth * r
+    c.height = 180 * r
+    c.getContext('2d').scale(r, r)
+    pad.current = new SignaturePad(c, { penColor: '#102a4c' })
+    return () => pad.current?.off()
+  }, [])
+  return (
+    <div>
+      <span className='eyebrow'>SIGNATURE</span>
+      <h2>วาดหรืออัปโหลดลายเซ็น</h2>
+      <canvas className='sig' ref={canvas} />
+      <div className='actions'>
+        <button className='ghost' onClick={() => pad.current.clear()}>
+          ล้าง
+        </button>
+        <button
+          className='primary'
+          onClick={() =>
+            !pad.current.isEmpty() && onData(pad.current.toDataURL())
+          }
+        >
+          ใช้ลายเซ็นนี้
+        </button>
+      </div>
+      <label>
+        อัปโหลด PNG/JPG
+        <input
+          type='file'
+          accept='image/png,image/jpeg'
+          onChange={e => {
+            const f = e.target.files[0]
+            if (!f) return
+            const r = new FileReader()
+            r.onload = () => onData(r.result)
+            r.readAsDataURL(f)
+          }}
+        />
+      </label>
+    </div>
+  )
+}
+function Modal ({ children, close }) {
+  return (
+    <div
+      className='modal'
+      onMouseDown={e => e.target === e.currentTarget && close()}
+    >
+      <div>
+        {children}
+        <button className='ghost full' onClick={close}>
+          ปิด
+        </button>
+      </div>
+    </div>
+  )
+}
